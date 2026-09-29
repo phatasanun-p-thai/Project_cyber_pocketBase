@@ -1,0 +1,103 @@
+### ============================================================
+###  POCKETBASE SECURITY MONITOR - ATTACK SIMULATION
+### ------------------------------------------------------------
+###  วิธีใช้งาน
+###    1)  ./pocketbase serve          (จะรัน migration ใน pb_migrations ให้เอง)
+###    2)  เปิด index.html -> Sign in ด้วยบัญชี superuser
+###    3)  ยิง STEP 1.1 และ STEP 2.1 ก่อน 1 ครั้ง
+###        (ผลลัพธ์ของ 2 request นี้จะถูกใช้อ้างอิงใน STEP 3)
+###    4)  ยิง request ใน STEP 3 ทีละอัน
+###
+###  ผลลัพธ์ที่คาดหวัง
+###    - TEST 1  -> attack_type = MASS_ASSIGNMENT / UNAUTHENTICATED_WRITE, severity = critical
+###                (ทำให้ Dashboard ขึ้น "ACCOUNT UNDER ATTACK" + ส่งอีเมลแจ้ง Admin)
+###    - TEST 2  -> attack_type = BOLA_IDOR, severity = high
+###                (BOLA = Broken Object Level Authorization คือยิง record ของคนอื่น)
+### ============================================================
+
+@host = http://127.0.0.1:8090
+@pw = Password123456
+
+### ------------------------------------------------------------
+### STEP 1 - SETUP : สร้างเหยื่อ (ทำครั้งเดียว)
+### ผลลัพธ์จะถูกเก็บไว้ให้อัตโนมัติ ด้วยชื่อ request = registerVictim
+### ------------------------------------------------------------
+
+### 1.1 สมัคร User ที่จะถูกโจมตี
+# @name registerVictim
+POST {{host}}/api/collections/users/records
+Content-Type: application/json
+
+{
+  "email": "victim@example.com",
+  "password": "{{pw}}",
+  "passwordConfirm": "{{pw}}"
+}
+
+###
+
+### 1.2 สมัคร User ผู้โจมตี
+POST {{host}}/api/collections/users/records
+Content-Type: application/json
+
+{
+  "email": "attacker@example.com",
+  "password": "{{pw}}",
+  "passwordConfirm": "{{pw}}"
+}
+
+### ------------------------------------------------------------
+### STEP 2 - SETUP : ดึง token ของมือโจมตี
+### ผลลัพธ์จะถูกเก็บไว้ให้อัตโนมัติ ด้วยชื่อ request = loginAttacker
+### ------------------------------------------------------------
+
+### 2.1 Login ในฐานะผู้โจมตี
+# @name loginAttacker
+POST {{host}}/api/collections/users/auth-with-password
+Content-Type: application/json
+
+{
+  "identity": "attacker@example.com",
+  "password": "{{pw}}"
+}
+
+###
+
+### ============================================================
+### STEP 3 - ATTACK REQUESTS (ยิงซ้ำหลายรอบเพื่อดูผลกระทบ)
+### ============================================================
+
+### [TEST 1] Unauthorized Attack: ไม่ส่ง token แล้วพยายามแก้ข้อมูลผู้อื่น
+###          + แนบ field สิทธิ์พิเศษ (role) เพื่อเพิ่มสิทธิ์ตัวเอง
+### Expected: 400/401/403 -> hook บันทึก attack_logs (severity: critical) + ส่งอีเมล
+PATCH {{host}}/api/collections/users/records/{{registerVictim.response.body.$.id}}
+Content-Type: application/json
+
+{
+  "role": "admin",
+  "verified": true
+}
+
+###
+
+### [TEST 2] BOLA / IDOR: มี token ของตัวเอง แต่ยิง record ของ victim
+### Expected: 403/404 -> hook บันทึก attack_logs (severity: high) + ส่งอีเมล
+DELETE {{host}}/api/collections/users/records/{{registerVictim.response.body.$.id}}
+Authorization: Bearer {{loginAttacker.response.body.$.token}}
+
+###
+
+### ------------------------------------------------------------
+### BONUS - ทดสอบ Brute Force (ยิงซ้ำ 5 ครั้งขึ้นไป)
+### ครั้งที่ 5 เป็นต้นไปจะถูกจัดเป็น attack_type = BRUTE_FORCE (critical)
+### และส่งอีเมลแจ้ง Admin
+### ------------------------------------------------------------
+
+### [TEST 3] Brute Force: Login ผิดพลาด
+POST {{host}}/api/collections/users/auth-with-password
+Content-Type: application/json
+
+{
+  "identity": "victim@example.com",
+  "password": "wrong-password-123"
+}

@@ -1,0 +1,26 @@
+services:
+  pocketbase:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pocketbase-security-monitor
+    container_name: pb-secmon
+    ports:
+      - "127.0.0.1:${POCKETBASE_PORT}:8090"
+    environment:
+      - SUPERUSER_EMAIL=${SUPERUSER_EMAIL}
+      - SUPERUSER_PASSWORD=${SUPERUSER_PASSWORD}
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASS=${SMTP_PASS}
+      - SMTP_FROM=${SMTP_FROM}
+    volumes:
+      - ./data-pb:/app/pb_data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8090/api/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped

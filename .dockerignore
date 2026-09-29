@@ -1,0 +1,15 @@
+# ข้อมูล runtime กับของที่ไม่จำเป็นต้อง build (เก็บไฟล์ใหญ่ ๆ ออกจาก context)
+pb_data/
+data-pb/
+pb_public/
+pocketbase.exe
+
+# compose / tooling
+docker-compose.yaml
+.env
+env.simple
+test.http
+
+.git/
+.gitignore
+*.log
