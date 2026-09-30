@@ -5,6 +5,9 @@ services:
       dockerfile: Dockerfile
     image: pocketbase-security-monitor
     container_name: pb-secmon
+    # ต้อง bind 0.0.0.0 ไม่ใช่ 127.0.0.1 (default ของ pocketbase) ไม่งั้น
+    # Docker จะ forward เข้ามาแล้วเจอ connection ถูกปิด
+    command: serve --http 0.0.0.0:8090
     ports:
       - "127.0.0.1:${POCKETBASE_PORT}:8090"
     environment:

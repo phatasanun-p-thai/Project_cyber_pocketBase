@@ -89,9 +89,10 @@
 
 <main class="mx-auto max-w-7xl space-y-5 px-4 py-6 sm:px-6">
 
+  <div id="gate-error" class="hidden rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-300"></div>
+
   <!-- ================= error / login ================= -->
   <section id="gate" class="rounded-xl border border-slate-800 bg-slate-900/60 p-5">
-    <div id="gate-error" class="mb-4 hidden rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-300"></div>
 
     <div class="grid gap-4 md:grid-cols-[1.4fr_1fr_1fr_auto] md:items-end">
       <div>
@@ -555,7 +556,9 @@ function renderFeed() {
   const list = visible().slice(0, CFG.maxAlerts);
 
   $("alert-count").textContent = String(state.events.length);
-  feed.innerHTML = "";
+  for (const child of [...feed.children]) {
+    if (child.id !== "feed-empty") child.remove();
+  }
   $("feed-empty").classList.toggle("hidden", list.length > 0);
 
   for (const event of list) {
