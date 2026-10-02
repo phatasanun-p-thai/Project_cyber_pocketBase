@@ -1,3 +1,7 @@
+// PocketBase generates this file on first `serve` (not on `migrate up`), and
+// pb_data/ is gitignored - so a fresh clone has no types.d.ts yet and your
+// editor will flag the reference as missing. Run the server once to create it:
+//     ./pocketbase serve          (Windows: .\pocketbase.exe serve)
 /// <reference path="../pb_data/types.d.ts" />
 
 // ============================================================================
@@ -6,6 +10,7 @@
 //  A single global router middleware intercepts every matched API route and
 //  inspects the outcome:
 //
+//    * privileged fields in an ACCEPTED body    -> privilege escalation
 //    * 401 / 403 / 404 responses  -> unauthenticated or unauthorised access
 //    * write requests on a concrete record id  -> possible BOLA / IDOR
 //    * bodies containing privileged fields      -> mass assignment / privilege
@@ -52,6 +57,11 @@ const SEC = {
     alertSeverities: ["high", "critical"],
     // Minimum gap between two alert emails for the same incident key.
     emailCooldownMs: 2 * 60 * 1000,
+    // Hard cap on alert emails per rolling window, per recipient. Protects the
+    // SMTP account from being used as a mail bomb by an attacker who rotates
+    // the request path/IP to defeat `emailCooldownMs`.
+    emailBurstLimit: 10,
+    emailBurstWindowMs: 10 * 60 * 1000,
 
     // --------------------------------------------------------- brute force
     // N failed logins from the same IP within the window == brute force.
@@ -65,18 +75,25 @@ const SEC = {
     // Keep false when PocketBase is exposed directly - e.realIP() trusts the
     // X-Forwarded-For / X-Real-IP headers and is trivially spoofable.
     trustProxyHeader: false,
+    // Skip the obvious read-only endpoints so a crawler or a browser prefetch
+    // cannot flood `attack_logs` with 404 noise.
+    // A trailing `*` matches by prefix.
+    ignorePaths: ["/api/health", "/api/realtime*", "/api/settings", "/api/logs"],
+    ignoreMethods: ["HEAD", "OPTIONS"],
 
     // ------------------------------------------------------- field lookups
     // Writing one of these through the public API is treated as an attempt to
     // grant yourself privileges. Tune the list to match your own schema.
+    // NOTE: `verified` is deliberately absent - it is a legit self-service field
+    // on an auth record (e-mail confirmation) and flagging it made every normal
+    // sign-up report as MASS_ASSIGNMENT.
     privilegedFields: [
         "role",
         "permissions",
-        "verified",
-        "emailverified",
         "isadmin",
         "superuser",
         "isstaff",
+        "tokenkey",
     ],
     // First of these found on the body / on the targeted record is reported as
     // the victim of the attack.
@@ -98,8 +115,15 @@ const WRITE_METHODS = ["POST", "PATCH", "PUT", "DELETE"];
 /** /api/collections/{collection}/records[/{recordId}] */
 const RECORD_PATH_RE = /^\/api\/collections\/([^\/]+)\/records(?:\/([^\/?]+))?/;
 
-/** /api/collections/{collection}/auth-with-password|auth-with-otp|auth-refresh */
-const AUTH_PATH_RE = /^\/api\/collections\/[^\/]+\/(auth-with-password|auth-with-otp|auth-refresh)$/;
+/**
+ * /api/collections/{collection}/auth-with-password|auth-with-otp
+ *
+ * `auth-refresh` is intentionally excluded: an expired/rotated token makes
+ * every dashboard poll answer 401, which used to be counted as a failed
+ * password attempt and could push a normal user over the brute force
+ * threshold.
+ */
+const AUTH_PATH_RE = /^\/api\/collections\/[^\/]+\/(auth-with-password|auth-with-otp)$/;
 
 /** SQLi / XSS heuristics - deliberately broad, false positives are logged as
  *  "injection probe" and never block the request. */
@@ -117,6 +141,8 @@ const INJECTION_RE = new RegExp(
 
 // Throttle bookkeeping (shared per process, see the NOTES block on top).
 const cooldowns = new Map();
+// Alert e-mail budget, per recipient: [timestamps...] inside the burst window.
+const mailBudget = new Map();
 let adminEmailCache = "";
 let adminEmailResolved = false;
 
@@ -146,12 +172,21 @@ let adminEmailResolved = false;
 function isIgnored(e) {
     const path = e.request.url.path || "";
 
-    // The SSE stream is a long lived request and is never an attack.
-    if (path.indexOf("/api/realtime") === 0) {
+    if (SEC.ignoreMethods.indexOf((e.request.method || "").toUpperCase()) !== -1) {
         return true;
     }
-    if (path === "/api/health") {
-        return true;
+
+    for (let i = 0; i < SEC.ignorePaths.length; i++) {
+        // The SSE stream is a long lived request and is never an attack, so it
+        // is matched by prefix; everything else by exact path.
+        if (SEC.ignorePaths[i].indexOf("*") !== -1) {
+            const prefix = SEC.ignorePaths[i].slice(0, -1);
+            if (path.indexOf(prefix) === 0) {
+                return true;
+            }
+        } else if (path === SEC.ignorePaths[i]) {
+            return true;
+        }
     }
 
     // Ignore the admin/dashboard traffic, otherwise every dashboard poll would
@@ -171,11 +206,15 @@ function isIgnored(e) {
 //  Detection
 // ============================================================================
 
+/**
+ * Classify and persist.
+ *
+ * `status < 400` does NOT mean "safe": a mass assignment that actually
+ * escalated a user to admin answers 200 and is far worse than a 403 that was
+ * rejected. The successful-request verdicts are therefore the ones that run
+ * first and can outrank the error-based ones.
+ */
 function report(e, status, errMsg) {
-    if (status < 400) {
-        return;
-    }
-
     try {
         const ctx = buildContext(e, status, errMsg);
         const verdict = classify(ctx);
@@ -213,15 +252,49 @@ function buildContext(e, status, errMsg) {
 function classify(ctx) {
     const method = ctx.method;
     const isWrite = WRITE_METHODS.indexOf(method) !== -1;
+    const failed = ctx.status >= 400;
 
     if (ctx.status === 429) {
         return { type: "RATE_LIMIT_HIT", severity: "low" };
     }
 
-    if (AUTH_PATH_RE.test(ctx.path)) {
-        return { type: "AUTH_FAILURE", severity: "low" };
+    // ------------------------------------------------------ success paths
+    // Checked before the error based verdicts below: a request that was
+    // *allowed* through is the interesting case.
+    const privileged = privilegedHits(ctx.body);
+    if (privileged.length > 0 && isWrite) {
+        return {
+            type: failed ? "MASS_ASSIGNMENT" : "PRIVILEGE_ESCALATION",
+            severity: !failed ? "critical" : ctx.auth ? "high" : "critical",
+            note: failed
+                ? "rejected privileged fields: " + privileged.join(", ")
+                : "ACCEPTED privileged fields: " + privileged.join(", "),
+        };
     }
 
+    if (!failed) {
+        // Everything below classifies a rejection; a 2xx write against another
+        // user's record is a successful BOLA, which PocketBase only reports as
+        // a 404 when an API rule hides it. Reaching here means the rules let it
+        // through, so it is only worth a row when someone else owns the record.
+        if (ctx.recordId && ctx.actor && !ownsRecord(ctx)) {
+            return {
+                type: "BOLA_IDOR",
+                severity: "high",
+                note: method + " on " + ctx.path + " succeeded on a foreign record",
+            };
+        }
+        return null;
+    }
+
+    // -------------------------------------------------------- error paths
+    //
+    // ORDER MATTERS: the injection probe is evaluated BEFORE the auth path
+    // check. A login attempt carrying `'`/`OR 1=1`/`union select` is an
+    // injection probe, and it used to be swallowed by AUTH_PATH_RE - which
+    // also fed it into the brute force counter, so an attacker could raise a
+    // CRITICAL brute force alert against a victim just by sending XSS/SQLi
+    // payloads at /auth-with-password.
     const probe = injectionProbe(ctx.rawQuery, ctx.body);
     if (probe) {
         return {
@@ -231,13 +304,9 @@ function classify(ctx) {
         };
     }
 
-    const privileged = privilegedHits(ctx.body);
-    if (privileged.length > 0 && isWrite) {
-        return {
-            type: "MASS_ASSIGNMENT",
-            severity: ctx.auth ? "high" : "critical",
-            note: "privileged fields: " + privileged.join(", "),
-        };
+    // เข้ามาถึงที่นี่แปลว่าเป็นการ login ล้มเหลวที่ "ปกติ" ไม่ใช่ payload แปลก ๆ
+    if (AUTH_PATH_RE.test(ctx.path)) {
+        return { type: "AUTH_FAILURE", severity: "low" };
     }
 
     // A write against a concrete record while carrying no credentials at all.
@@ -344,6 +413,31 @@ function hasInjectionMarker(text) {
     return Boolean(text) && INJECTION_RE.test(text);
 }
 
+/**
+ * True when the authenticated caller is the record itself or its owner.
+ *
+ * Used only to decide whether a *successful* write deserves a row, so it stays
+ * conservative: anything it cannot prove returns false and the write gets
+ * logged. False positives on reads are preferable to blind spots here.
+ */
+function ownsRecord(ctx) {
+    try {
+        const caller = $app.findRecordById(ctx.collection, ctx.actor);
+        return caller.id === ctx.recordId;
+    } catch (err) {
+        // not an auth record, or the caller is not readable by the hook
+    }
+
+    for (let i = 0; i < SEC.ownerFields.length; i++) {
+        const field = SEC.ownerFields[i];
+        if (ctx.body && ctx.body[field] && String(ctx.body[field]) === ctx.actor) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 /** An anonymous `POST /api/collections/{auth}/records` is a signup, not an attack. */
 function isSelfRegistration(ctx) {
     if (ctx.method !== "POST" || ctx.recordId || !ctx.collection) {
@@ -416,12 +510,43 @@ function writeIncident(ctx, verdict, note) {
     );
 
     if (SEC.alertSeverities.indexOf(verdict.severity) !== -1) {
-        if (allowOnce("mail:" + key, SEC.emailCooldownMs)) {
-            sendSecurityAlert(ctx, verdict, payload, record);
+        const recipient = resolveAdminEmail();
+        if (allowOnce("mail:" + key, SEC.emailCooldownMs) && takeMailBudget(recipient)) {
+            sendSecurityAlert(ctx, verdict, payload, record, recipient);
+        } else {
+            console.log(
+                "[security] alert e-mail suppressed (cooldown or burst budget) for " + key
+            );
         }
     }
 
     return record;
+}
+
+/**
+ * Rolling-window cap on alert e-mails. `emailCooldownMs` alone is keyed by
+ * type|ip|method|path, so an attacker who varies the path (or spoofs the ip
+ * once trustProxyHeader is on) can still force one mail per hit.
+ */
+function takeMailBudget(recipient) {
+    if (!recipient) {
+        return false;
+    }
+
+    const now = Date.now();
+    const key = recipient.toLowerCase();
+    const sent = (mailBudget.get(key) || []).filter(function (at) {
+        return now - at < SEC.emailBurstWindowMs;
+    });
+
+    if (sent.length >= SEC.emailBurstLimit) {
+        mailBudget.set(key, sent);
+        return false;
+    }
+
+    sent.push(now);
+    mailBudget.set(key, sent);
+    return true;
 }
 
 function saveIncident(ctx, verdict, payload) {
@@ -526,6 +651,8 @@ function buildPayload(ctx, verdict, note) {
         note: note || "",
         endpoint: ctx.path,
         method: ctx.method,
+        // ctx.errMsg can carry a raw PocketBase validation message, which may
+        // echo the submitted value back. Keep it, but bounded.
         status: ctx.status,
         actor: ctx.actor,
         collection: ctx.collection || "",
@@ -598,8 +725,7 @@ function isSecret(key) {
 //  Mailer
 // ============================================================================
 
-function sendSecurityAlert(ctx, verdict, payload, record) {
-    const to = resolveAdminEmail();
+function sendSecurityAlert(ctx, verdict, payload, record, to) {
     if (!to) {
         console.log(
             "[security] no admin email available - set SEC.adminEmail or create a _superusers account"
@@ -655,6 +781,12 @@ function sendSecurityAlert(ctx, verdict, payload, record) {
         text += details[i][0] + ": " + details[i][1] + "\n";
     }
 
+    // Logged incidents are untrusted input: the body is escaped for the HTML
+    // part below and never interpolated raw, but the plain text part is what
+    // most mobile clients render, so it is kept free of control characters.
+    const safeText = collapseControlChars(payload);
+    const safeError = collapseControlChars(ctx.errMsg || "");
+
     const message = new MailerMessage({
         from: { address: sender, name: "PocketBase Security Bot" },
         to: [{ address: to }],
@@ -663,7 +795,7 @@ function sendSecurityAlert(ctx, verdict, payload, record) {
             "Security incident detected.\n\n" +
             text +
             "\nPayload:\n" +
-            payload +
+            safeText +
             "\n",
         html:
             '<div style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;max-width:640px">' +
@@ -752,12 +884,23 @@ function allowOnce(key, ms) {
     }
     cooldowns.set(key, now);
 
-    if (cooldowns.size > 1000) {
+    // Hard cap: an attacker rotating the ip/path would otherwise grow this map
+    // without bound for the lifetime of the process.
+    if (cooldowns.size > 2000) {
         cooldowns.forEach(function (value, k) {
             if (now - value > ms * 20) {
                 cooldowns.delete(k);
             }
         });
+        // still oversized (everything is fresh) -> drop the oldest quarter
+        if (cooldowns.size > 2000) {
+            const keys = Array.from(cooldowns.keys()).sort(function (a, b) {
+                return cooldowns.get(a) - cooldowns.get(b);
+            });
+            for (let i = 0; i < keys.length / 4; i++) {
+                cooldowns.delete(keys[i]);
+            }
+        }
     }
 
     return true;
@@ -830,6 +973,16 @@ function toPlainObject(value) {
     }
 }
 
+/**
+ * Strips C0 control characters (except tab/newline) so a payload cannot forge
+ * extra lines in the plain text part of the alert mail - the classic
+ * "header/body split" trick when the address itself is attacker influenced.
+ */
+function collapseControlChars(value) {
+    // eslint-disable-next-line no-control-regex
+    return String(value).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "?");
+}
+
 function escapeHtml(value) {
     return String(value === null || value === undefined ? "" : value)
         .replace(/&/g, "&amp;")
@@ -860,6 +1013,11 @@ function smtpFromEnv() {
     return env.SMTP_FROM || env.SMTP_USER;
 }
 
+/**
+ * `tls: true` means implicit TLS (SMTPS, usually 465). `SMTP_PORT=587` is
+ * STARTTLS on a plain connection, which needs `tls: false` - the previous hard
+ * coded `true` made every alert fail against the common 587 setup.
+ */
 function newAlertMailClient() {
     const env = envSettings();
     const host = env.SMTP_HOST;
@@ -868,13 +1026,18 @@ function newAlertMailClient() {
         return $app.newMailClient();
     }
 
+    const port = Number(env.SMTP_PORT || 587);
+    const implicitTls = String(env.SMTP_TLS || "").toLowerCase() === "implicit";
+
     return $app.newMailClient({
         enabled: true,
         host: host,
-        port: Number(env.SMTP_PORT || 587),
+        port: port,
         username: env.SMTP_USER || "",
         password: env.SMTP_PASS || "",
-        tls: true,
+        // implicit TLS only on 465, otherwise let the client negotiate
+        // STARTTLS on 587 (PocketBase falls back to it when tls is false).
+        tls: implicitTls || port === 465,
         sendmail: "",
         from: smtpFromEnv() || "security@localhost",
     });

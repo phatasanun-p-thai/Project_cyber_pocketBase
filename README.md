@@ -1,0 +1,151 @@
+# PocketBase Security Monitor (SIEM)
+
+SIEM เล็ก ๆ บน PocketBase — ดักจับการโจมตีที่ผ่าน REST API ทุก request แล้วบันทึกลง
+collection `attack_logs` พร้อมส่งอีเมลแจ้งเตือนเมื่อเจอเคสระดับ high / critical
+
+| ส่วน | ที่อยู่ |
+| --- | --- |
+| Middlehook ตรวจจับ | `pb_hooks/main.pb.js` |
+| Schema + API rules | `pb_migrations/` |
+| หน้าแดชบอร์ด (Tailwind ไม่มี build step) | `pb_public/index.html` |
+| Docker | `Dockerfile`, `docker-compose.yaml`, `docker/entrypoint.sh` |
+| ชุดทดสอบการโจมตี | `test.http` |
+
+## เริ่มใช้งานแบบ Docker (แนะนำ)
+
+```bash
+cp .env.example .env      # Windows: Copy-Item .env.example .env
+# แก้ค่าใน .env อย่างน้อย SUPERUSER_EMAIL / SUPERUSER_PASSWORD
+docker compose up -d --build
+```
+
+เปิด <http://127.0.0.1:8090> แล้ว Sign in ด้วยบัญชี superuser
+
+- port ถูก publish ไว้ที่ `127.0.0.1` **เท่านั้น** (`POCKETBASE_PORT` เปลี่ยนได้)
+  ถ้าจะเปิดออกนอกเครื่อง ต้องมี reverse proxy ที่มี TLS + auth ตั้งไว้ข้างหน้าเสมอ
+  admin UI ของ PocketBase และแดชบอร์ดนี้ไม่มี authentication นอกเหนือจากตัว login
+- `SUPERUSER_EMAIL` / `SUPERUSER_PASSWORD` ถูก `superuser upsert` ทุกครั้งที่ container
+  start (idempotent) ดู `docker/entrypoint.sh`
+- healthcheck อยู่ใน `Dockerfile` เท่านั้น `compose` ไม่นิยามซ้ำ
+
+## เริ่มใช้งานแบบ local (ไม่มี Docker)
+
+PocketBase ต้องอยู่ในโฟลเดอร์เดียวกับ `pb_hooks/`, `pb_migrations/`, `pb_public/`
+เพราะ path ทั้งหลาย derive จากตำแหน่งไฟล์ executable (ไม่ใช่ working directory)
+
+```bash
+# 1.2x ขึ้นไป (arm64 / armv6 ต้องเลือก asset ให้ตรงสถาปัตยกรรมเอง)
+curl -fsSL -o pocketbase.zip \
+  https://github.com/pocketbase/pocketbase/releases/download/v0.40.4/pocketbase_0.40.4_linux_amd64.zip
+unzip -q pocketbase.zip && rm pocketbase.zip
+
+# สร้าง superuser
+./pocketbase superuser upsert you@example.com 'your-password'   # Windows: .\pocketbase.exe ...
+
+# รัน (รันครั้งแรกจะสร้าง pb_data/ และ pb_data/types.d.ts ให้เอง)
+./pocketbase serve
+```
+
+> `pocketbase migrate up` จะ**ไม่**สร้าง `pb_data/types.d.ts` — ไฟล์นี้ถูก generate
+> ตอน `serve` เท่านั้น ถ้า editor บอกว่า `pb_hooks/main.pb.js` อ้างไฟล์ที่หาไม่เจอ
+> ให้รัน server สักครั้งก่อน
+
+## ทดสอบว่า hook ทำงาน
+
+เปิด `test.http` ด้วย VS Code REST Client / IntelliJ HTTP Client แล้วยิงตามลำดับ
+
+1. `docker compose up -d --build` (หรือ `./pocketbase serve`)
+2. เปิด <http://127.0.0.1:8090> → Sign in ด้วย superuser แล้วเปิดแดชบอร์ดค้างไว้
+3. ยิง **STEP 1** ครั้งแรก 1 ครั้งต่อ instance ที่ยังสะอาด (สมัคร victim + attacker)
+4. ยิง **STEP 2 / 3 / 4** ทีละ request แล้วดูแดชบอร์ด
+
+หัวไฟล์ `test.http` มีตารางผลลัพธ์ที่คาดหวังอยู่แล้ว **ตรงกับพฤติกรรมจริง** ณ ปัจจุบัน
+ถ้าแก้ `classify()` ใน hook ต้องแก้ตารางนั้นตามด้วย ไม่งั้นเอกสารจะโกหกตัวเอง
+
+## hook ตรวจอะไรบ้าง
+
+| attack_type | เงื่อนไข |
+| --- | --- |
+| `PRIVILEGE_ESCALATION` | write ที่สำเร็จ และ body มี field สิทธิ์พิเศษ (`role`, `isadmin`, ...) |
+| `MASS_ASSIGNMENT` | เหมือนข้างบนแต่ถูกปฏิเสธ |
+| `BOLA_IDOR` | write/read ที่กระทบ record ของคนอื่น รวมถึง 404 ที่กติกา API rule ซ่อน record ไว้ |
+| `UNAUTHENTICATED_WRITE` | write ที่ไม่มี token และไม่ใช่การสมัครสมาชิก |
+| `UNAUTHENTICATED_ACCESS` / `FORBIDDEN_ACCESS` | 401 / 403 |
+| `AUTH_FAILURE` | login ผิดรหัส |
+| `BRUTE_FORCE` | `AUTH_FAILURE` จาก IP เดียวกันครบ 5 ครั้งใน 2 นาที (critical) |
+| `INJECTION_PROBE` | SQLi / XSS marker ใน query string หรือ body |
+| `RATE_LIMIT_HIT` | 429 |
+
+ทุกค่าปรับได้ที่ object `SEC` ด้านบนของ `pb_hooks/main.pb.js`
+
+### ข้อควรรู้เรื่อง hook
+
+- hook เป็น **ผู้สังเกตการณ์เท่านั้น** ไม่ block คำขอใด ๆ ชั้นความปลอดภัยจริงอยู่ที่
+  API rules ใน migrations
+- **อย่าย้าย helper ออกไปนอก callback ของ `routerUse`** PocketBase รัน hook ผ่าน
+  goja runtime แบบ pooled และเรียก middleware จาก source ที่ถูก serialize ไว้
+  ตัวแปรระดับไฟล์จึง out of scope ตอน callback ทำงาน และจะกลายเป็น
+  `ReferenceError` ที่ PocketBase รายงานเป็น HTTP 400 ทั้งระบบ
+- `trustProxyHeader: false` ไว้เพราะ `e.realIP()` เชื่อ header `X-Forwarded-For` ที่
+  spoof ได้ง่าย ถ้าวางหลัง reverse proxy ที่เขียน header นี้ให้เที่ยวจริงค่อยเปิด
+- ตัวนับ brute force อ่านกลับจาก DB ทุกครั้ง ไม่พึ่ง state ใน memory ล้วน การ restart
+  PocketBase จึงไม่ทำให้ทั้งระบบตื่นตัวพร้อมกัน
+
+## collection
+
+- **`attack_logs`** — ล็อก **superuser เท่านั้น** (rule เป็น `null`) ไม่ว่าจะ list, view,
+  create, update, delete การเปิด self-service ไว้ให้ผู้ใช้ทั่วไปอ่าน incident ทั้งหมด
+  เป็นช่องรั่วที่เคยเกิดขึ้นและถูกแก้ใน migration `1790640001`
+  hook เขียนผ่าน `$app.save()` ซึ่งข้าม API rules
+- **`users`** — auth collection สำหรับเป็นเหยื่อของ `test.http` สร้างใน
+  `1790640002` เปิด self-registration ไว้เพื่อให้ทดสอบได้ ถ้าขึ้น production ต้อง
+  เปลี่ยน `createRule` เป็น `null` และตัด field สิทธิ์พิเศษออก (ดูคอมเมนต์ในไฟล์)
+
+### กฎ PocketBase ที่มักเข้าใจผิด
+
+```
+null  = ให้ superuser อย่างเดียว   <- ล็อก
+""    = สาธารณะ / ไม่ต้องล็อกอิน  <- เปิดโล่ง
+```
+
+## อีเมลแจ้งเตือน
+
+จะส่งเมื่อ severity เป็น `high` หรือ `critical` เท่านั้น ตั้งค่าใน `.env`:
+
+| ตัวแปร | หมายเหตุ |
+| --- | --- |
+| `SMTP_HOST` | ว่าง = ปิดการส่งอีเมล (hook จะ log ว่าไม่ได้ตั้งค่า) |
+| `SMTP_PORT` | `465` = SMTPS / `587` = STARTTLS |
+| `SMTP_TLS` | ค่า `implicit` บังคับ TLS ตรง (ค่าปริยายคือปล่อยให้ client ต่อรอง) |
+| `SMTP_USER` / `SMTP_PASS` / `SMTP_FROM` | Gmail ต้องใช้ App Password |
+
+ผู้รับเริ่มต้นคืออีเมลของ superuser คนแรก (หรือกำหนดเองที่ `SEC.adminEmail`)
+มี cooldown 2 นาทีต่อ incident และเพดาน 10 ฉบับ / 10 นาทีต่อผู้รับ กันใช้บัญชี SMTP
+เป็น mail bomb
+
+## โครงสร้างโฟลเดอร์
+
+```
+pb_hooks/main.pb.js     middleware ตรวจจับทั้งหมด
+pb_migrations/          1790640000 attack_logs
+                        1790640001 ล็อก attack_logs ให้ superuser
+                        1790640002 users (เหยื่อสำหรับ test.http)
+pb_public/index.html    แดชบอร์ด realtime
+pb_data/                ฐานข้อมูลจริง + types.d.ts (gitignored)
+test.http               ชุดทดสอบการโจมตี
+```
+
+`pb_data/` คือฐานข้อมูลจริงที่ `docker-compose.yaml` mount เข้าไป **มีแค่ที่เดียว**
+ถ้าเคยเจอโฟลเดอร์ `data-pb/` แปลว่าเป็นข้อมูลชุดเก่าที่ไม่ได้ถูกใช้ — ลบทิ้งได้
+
+## ก่อนขึ้น production
+
+- [ ] เปลี่ยน `SUPERUSER_PASSWORD` เป็นค่าสุ่มยาว ๆ และอย่า commit `.env`
+- [ ] เปลี่ยน `users.createRule` เป็น `null` ถ้าไม่ต้องการ self-service
+- [ ] ตัด field สิทธิ์พิเศษออกจาก schema หรือป้องกันด้วย validation hook
+- [ ] ตั้ง reverse proxy ที่มี TLS ต่อหน้า อย่าออก port 8090 ตรง ๆ
+- [ ] ตั้ง `SEC.trustProxyHeader = true` **เฉพาะเมื่อ** reverse proxy เขียน
+      `X-Forwarded-For` ให้เที่ยวจริง
+- [ ] สำรอง `pb_data/` และกำหนดว่าจะเก็บ incident นานแค่ไหน (ตอนนี้ไม่มีการล้างอัตโนมัติ)
+- [ ] ตรวจว่าเข้า `cdn.tailwindcss.com` จากเน็ตภายนอกได้ ถ้าไม่ได้ให้ self-host
+      Tailwind แล้วเพิ่ม CSP

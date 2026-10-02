@@ -1,15 +1,27 @@
-# ข้อมูล runtime กับของที่ไม่จำเป็นต้อง build (เก็บไฟล์ใหญ่ ๆ ออกจาก context)
+# ---------------------------------------------------------------- secrets
+# ห้ามให้ credential ใด ๆ หลุดเข้า build context แม้แต่กรณีไฟล์ไม่ได้ถูก COPY
+# (ไฟล์ที่ไม่ได้ COPY ยังส่งไปยัง build context และอาจโดน cache เก็บไว้)
+.env
+.env.*
+!.env.example
+
+# ------------------------------------------------------ PocketBase runtime
+# pb_data คือฐานข้อมูลจริง (รวม password hash ของ superuser)
 pb_data/
 data-pb/
-pb_public/
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+.notify
+pocketbase
 pocketbase.exe
 
-# compose / tooling
-docker-compose.yaml
-.env
-env.simple
-test.http
-
+# ---------------------------------------------------------------- tooling
 .git/
 .gitignore
+.dockerignore
+node_modules/
 *.log
+.vscode/
+.idea/

@@ -1,0 +1,27 @@
+# ---------------------------------------------------------------- secrets
+# ห้าม commit ค่า credential ใด ๆ - ใช้ .env.example เป็นต้นแบบแทน
+.env
+.env.*
+!.env.example
+env.simple
+
+# ------------------------------------------------- PocketBase runtime data
+# pb_data คือฐานข้อมูลจริง (รวม password hash ของ superuser) ต้องเก็บไว้บนเครื่อง
+pb_data/
+data-pb/
+# binary ของ PocketBase ดาวน์โหลดเองตอน setup (ดู README)
+pocketbase
+pocketbase.exe
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+.notify
+
+# ---------------------------------------------------------------- tooling
+node_modules/
+*.log
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,6 +1,6 @@
 // pb_migrations/1790640000_init_attack_logs.js
 //
-// Creates the collection consumed by pb_hooks/security.js.
+// Creates the collection consumed by pb_hooks/main.pb.js.
 // The hook writes with `$app.save()`, so the API rules below only govern what
 // clients (i.e. the realtime dashboard) are allowed to read.
 
@@ -18,15 +18,24 @@ migrate(
             name: "attack_logs",
             type: "base",
 
-            // readable by any authenticated user, and by every superuser
-            listRule: '@request.auth.id != ""',
-            viewRule: '@request.auth.id != ""',
+            // SUPERUSER ONLY -> the rule must be `null`.
+            //
+            // PocketBase rule semantics, easy to get backwards:
+            //   null = superuser only   <- locked
+            //   ""   = public / guest   <- anyone, even anonymous
+            //
+            // These were originally `@request.auth.id != ""`, which any throwaway
+            // sign-up could satisfy and then read the whole incident history.
+            // Migration 1790640001 re-applies the locked rules for databases that
+            // already ran this one.
+            listRule: null,
+            viewRule: null,
 
             // incidents are immutable from the outside: the hook uses
             // `$app.save()` which bypasses the API rules
-            createRule: "",
-            updateRule: "",
-            deleteRule: "",
+            createRule: null,
+            updateRule: null,
+            deleteRule: null,
 
             fields: [
                 {
@@ -114,6 +123,8 @@ migrate(
             indexes: [
                 "CREATE INDEX idx_attack_logs_created ON attack_logs (created)",
                 "CREATE INDEX idx_attack_logs_ip ON attack_logs (ip)",
+                "CREATE INDEX idx_attack_logs_type_created ON attack_logs (attack_type, created)",
+                "CREATE INDEX idx_attack_logs_severity_created ON attack_logs (severity, created)",
             ],
         });
 

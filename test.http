@@ -1,75 +1,158 @@
 ### ============================================================
-###  POCKETBASE SECURITY MONITOR - ATTACK SIMULATION
+###  POCKETBASE SECURITY MONITOR - ATTACK SIMULATION SUITE
 ### ------------------------------------------------------------
-###  วิธีใช้งาน
-###    1)  ./pocketbase serve          (จะรัน migration ใน pb_migrations ให้เอง)
-###    2)  เปิด index.html -> Sign in ด้วยบัญชี superuser
-###    3)  ยิง STEP 1.1 และ STEP 2.1 ก่อน 1 ครั้ง
-###        (ผลลัพธ์ของ 2 request นี้จะถูกใช้อ้างอิงใน STEP 3)
-###    4)  ยิง request ใน STEP 3 ทีละอัน
+###  วิธีใช้งาน (VS Code REST Client / IntelliJ HTTP Client)
+###    1)  docker compose up -d --build        (หรือ ./pocketbase serve)
+###    2)  เปิด http://127.0.0.1:8090 -> Sign in ด้วยบัญชี superuser
+###        (ค่าจาก .env ของคุณ) แล้วเปิดหน้า dashboard ค้างไว้
+###    3)  ยิง STEP 1 (setup) ก่อน 1 ครั้งต่อ instance ที่ยังสะอาด
+###    4)  ยิง STEP 2 ทีละ request แล้วดู dashboard ทันที
 ###
-###  ผลลัพธ์ที่คาดหวัง
-###    - TEST 1  -> attack_type = MASS_ASSIGNMENT / UNAUTHENTICATED_WRITE, severity = critical
-###                (ทำให้ Dashboard ขึ้น "ACCOUNT UNDER ATTACK" + ส่งอีเมลแจ้ง Admin)
-###    - TEST 2  -> attack_type = BOLA_IDOR, severity = high
-###                (BOLA = Broken Object Level Authorization คือยิง record ของคนอื่น)
+###  ผลลัพธ์ที่คาดหวัง (severity อยู่ในคอลัมน์ Severity)
+###  ตารางนี้ตรงกับพฤติกรรมจริงของ pb_hooks/main.pb.js ณ ปัจจุบัน
+###  (ถ้าแก้ classify() ใน hook ต้องแก้ตารางนี้ตามด้วย)
+###
+###   1.1  register            -> ไม่มี log (self-registration ปกติ)
+###   1.2  register            -> ไม่มี log
+###   2.1  login ผิดรหัสครั้งที่5-> BRUTE_FORCE   critical  + อีเมลแจ้ง
+###   3.1  patch ไม่มี token    -> MASS_ASSIGNMENT critical (role ถูก PocketBase ทิ้ง)
+###   3.2  patch มี token คนอื่น-> MASS_ASSIGNMENT high    <- ไม่ใช่ BOLA
+###                                เพราะ classify() ตรวจ privileged field ใน body
+###                                ก่อน และ body นี้มี role อยู่ กติกา updateRule
+###                                จึงยังไม่ถูกพิจารณา
+###   3.3  delete record คนอื่น -> BOLA_IDOR     high
+###   3.4  GET record ที่ไม่มี -> BOLA_IDOR       medium
+###   3.5  ?filter=<script>    -> INJECTION_PROBE high
+###   3.6  body มี <script>    -> INJECTION_PROBE high
+###                                (hook เช็ค injection ก่อน AUTH_PATH_RE
+###                                 จึงไม่ถูกนับเป็น brute force มั่ว)
+###   3.7  GET /../pb_data/... -> 200 แต่ body เป็น index.html ไม่ใช่ data.db
+###                                (Go normalize path `..` ก่อนถึง PocketBase
+###                                 แล้ว 404 ตกไปที่ SPA fallback) และไม่มี log
+###   3.8  ยิง auth-refresh ผิด-> UNAUTHENTICATED_WRITE medium xN
+###                                (ไม่ถูกนับเป็น brute force เพราะตัดออกจาก
+###                                 AUTH_PATH_RE แล้ว แต่ยังตกไปเข้าเคส
+###                                 anonymous write ไม่ใช่ "ไม่มี log")
+###   3.9  OPTIONS any path    -> ไม่มี log
+###   4.1  อ่าน attack_logs    -> 403 (และถูก log เป็น FORBIDDEN_ACCESS low)
+###   4.2  realtime handshake  -> 200 สำหรับทุก token ที่ยัง valid
+###                                รวมทั้ง user ธรรมดา -> ต่อได้เสมอ จึง
+###                                "ต่อได้" ไม่ใช่หลักฐานว่ารั่ว ต้องดูว่า
+###                                event ของ attack_logs ส่งถึง user หรือไม่
 ### ============================================================
 
 @host = http://127.0.0.1:8090
+@victim = victim@example.com
+@attacker = attacker@example.com
 @pw = Password123456
 
 ### ------------------------------------------------------------
 ### STEP 1 - SETUP : สร้างเหยื่อ (ทำครั้งเดียว)
-### ผลลัพธ์จะถูกเก็บไว้ให้อัตโนมัติ ด้วยชื่อ request = registerVictim
 ### ------------------------------------------------------------
 
-### 1.1 สมัคร User ที่จะถูกโจมตี
+### 1.1 สมัคร victim (ผลลัพธ์ถูกเก็บเป็น registerVictim ให้อัตโนมัติ)
 # @name registerVictim
 POST {{host}}/api/collections/users/records
 Content-Type: application/json
 
 {
-  "email": "victim@example.com",
+  "email": "{{victim}}",
   "password": "{{pw}}",
   "passwordConfirm": "{{pw}}"
 }
 
 ###
 
-### 1.2 สมัคร User ผู้โจมตี
+### 1.2 สมัคร attacker (ผลลัพธ์ถูกเก็บเป็น registerAttacker ให้อัตโนมัติ)
+# @name registerAttacker
 POST {{host}}/api/collections/users/records
 Content-Type: application/json
 
 {
-  "email": "attacker@example.com",
+  "email": "{{attacker}}",
   "password": "{{pw}}",
   "passwordConfirm": "{{pw}}"
 }
 
-### ------------------------------------------------------------
-### STEP 2 - SETUP : ดึง token ของมือโจมตี
-### ผลลัพธ์จะถูกเก็บไว้ให้อัตโนมัติ ด้วยชื่อ request = loginAttacker
-### ------------------------------------------------------------
+###
 
-### 2.1 Login ในฐานะผู้โจมตี
+### 1.3 login ในฐานะ attacker -> เก็บเป็น loginAttacker
 # @name loginAttacker
 POST {{host}}/api/collections/users/auth-with-password
 Content-Type: application/json
 
 {
-  "identity": "attacker@example.com",
+  "identity": "{{attacker}}",
   "password": "{{pw}}"
+}
+
+### ------------------------------------------------------------
+### STEP 2 - AUTH FAILURE / BRUTE FORCE
+### ------------------------------------------------------------
+
+### 2.1 login ผิดรหัสครั้งที่ 1 -> AUTH_FAILURE low
+POST {{host}}/api/collections/users/auth-with-password
+Content-Type: application/json
+
+{
+  "identity": "{{victim}}",
+  "password": "wrong-password-1"
 }
 
 ###
 
-### ============================================================
-### STEP 3 - ATTACK REQUESTS (ยิงซ้ำหลายรอบเพื่อดูผลกระทบ)
-### ============================================================
+### 2.2 ครั้งที่ 2
+POST {{host}}/api/collections/users/auth-with-password
+Content-Type: application/json
 
-### [TEST 1] Unauthorized Attack: ไม่ส่ง token แล้วพยายามแก้ข้อมูลผู้อื่น
-###          + แนบ field สิทธิ์พิเศษ (role) เพื่อเพิ่มสิทธิ์ตัวเอง
-### Expected: 400/401/403 -> hook บันทึก attack_logs (severity: critical) + ส่งอีเมล
+{
+  "identity": "{{victim}}",
+  "password": "wrong-password-2"
+}
+
+###
+
+### 2.3 ครั้งที่ 3
+POST {{host}}/api/collections/users/auth-with-password
+Content-Type: application/json
+
+{
+  "identity": "{{victim}}",
+  "password": "wrong-password-3"
+}
+
+###
+
+### 2.4 ครั้งที่ 4 (ยังต่ำกว่า threshold = 5)
+POST {{host}}/api/collections/users/auth-with-password
+Content-Type: application/json
+
+{
+  "identity": "{{victim}}",
+  "password": "wrong-password-4"
+}
+
+###
+
+### 2.5 ครั้งที่ 5 -> ตัด threshold -> BRUTE_FORCE critical + ส่งอีเมลแจ้ง Admin
+###     (ต้องรัน 2.1-2.5 ภายใน 2 นาที ไม่งั้น window จะหมดแล้วนับใหม่)
+POST {{host}}/api/collections/users/auth-with-password
+Content-Type: application/json
+
+{
+  "identity": "{{victim}}",
+  "password": "wrong-password-5"
+}
+
+### ------------------------------------------------------------
+### STEP 3 - ACCESS CONTROL / BOLA / INJECTION
+### ------------------------------------------------------------
+
+### 3.1 [TEST 1] Mass assignment ไม่มี token + ยัด field สิทธิ์พิเศษ
+###     -> MASS_ASSIGNMENT critical (PocketBase ทิ้ง field ที่ไม่รู้จัก ไม่ให้เปลี่ยนจริง)
+###     (ช่อง `verified` ถูกตัดออกจาก SEC.privilegedFields เพราะเป็นฟิลด์
+###      self-service ปกติของ auth record - ถ้าไม่ตัด ทุกการสมัครสมาชิก
+###      ปกติจะถูกรายงานเป็น MASS_ASSIGNMENT)
 PATCH {{host}}/api/collections/users/records/{{registerVictim.response.body.$.id}}
 Content-Type: application/json
 
@@ -80,24 +163,92 @@ Content-Type: application/json
 
 ###
 
-### [TEST 2] BOLA / IDOR: มี token ของตัวเอง แต่ยิง record ของ victim
-### Expected: 403/404 -> hook บันทึก attack_logs (severity: high) + ส่งอีเมล
+### 3.2 Vertical privilege: attacker แก้ record ของ victim
+###     -> MASS_ASSIGNMENT high
+###     (ไม่ใช่ BOLA_IDOR เพราะ classify() มองหา privileged field ใน body ก่อน
+###      และถึงจะไปตรวจ BOLA ก็ยังไม่ทัน - body ของ 3.2 มี role อยู่)
+PATCH {{host}}/api/collections/users/records/{{registerVictim.response.body.$.id}}
+Authorization: Bearer {{loginAttacker.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "role": "admin"
+}
+
+###
+
+### 3.3 [TEST 2] Horizontal: attacker ลบ record ของ victim
+###     -> BOLA_IDOR high
 DELETE {{host}}/api/collections/users/records/{{registerVictim.response.body.$.id}}
 Authorization: Bearer {{loginAttacker.response.body.$.token}}
 
 ###
 
-### ------------------------------------------------------------
-### BONUS - ทดสอบ Brute Force (ยิงซ้ำ 5 ครั้งขึ้นไป)
-### ครั้งที่ 5 เป็นต้นไปจะถูกจัดเป็น attack_type = BRUTE_FORCE (critical)
-### และส่งอีเมลแจ้ง Admin
-### ------------------------------------------------------------
+### 3.4 อ่าน record ที่ไม่มีสิทธิ์ -> BOLA_IDOR medium
+GET {{host}}/api/collections/users/records/{{registerVictim.response.body.$.id}}
+Authorization: Bearer {{loginAttacker.response.body.$.token}}
 
-### [TEST 3] Brute Force: Login ผิดพลาด
+###
+
+### 3.5 Injection probe ใน query string -> INJECTION_PROBE high
+GET {{host}}/api/collections/users/records?filter=(email)%3D%27victim@example.com%27%20or%201%3D1
+Authorization: Bearer {{loginAttacker.response.body.$.token}}
+
+###
+
+### 3.6 Injection probe ใน body (XSS payload) -> INJECTION_PROBE high
 POST {{host}}/api/collections/users/auth-with-password
 Content-Type: application/json
 
 {
-  "identity": "victim@example.com",
-  "password": "wrong-password-123"
+  "identity": "<script>alert(document.cookie)</script>",
+  "password": "' OR '1'='1"
 }
+
+###
+
+### 3.7 Path traversal -> ต้องได้ HTML ของ dashboard ห้ามได้ data.db
+###     (URL จะถูก normalize ที่ `..` ก่อนถึง PocketBase ทำให้ path traversal
+###      ไม่มีผล และ hook จะไม่สร้าง incident เพราะไม่ match route ที่มันเฝ้า)
+GET {{host}}/api/collections/users/records/../../pb_data/data.db
+
+###
+
+### 3.8 auth-refresh ที่ token ผิด -> UNAUTHENTICATED_WRITE medium
+###     ยิงซ้ำ 6 ครั้ง: ต้องไม่มี BRUTE_FORCE เพิ่ม (auth-refresh ถูกตัดออกจาก
+###     AUTH_PATH_RE) แต่จะมี UNAUTHENTICATED_WRITE 6 แถว ไม่ใช่ "ไม่มี log"
+POST {{host}}/api/collections/users/auth-refresh
+Content-Type: application/json
+
+{
+  "token": "obviously-not-a-valid-token"
+}
+
+###
+
+### 3.9 OPTIONS preflight -> ไม่ควรมี log
+OPTIONS {{host}}/api/collections/users/records
+
+###
+
+### ------------------------------------------------------------
+### STEP 4 - ตรวจว่า user ธรรมดาอ่าน attack_logs ไม่ได้ (สำคัญ)
+### คาดหวัง: HTTP 403/404 และมี incident FORBIDDEN_ACCESS low 1 รายการ
+### ------------------------------------------------------------
+
+GET {{host}}/api/collections/attack_logs/records
+Authorization: Bearer {{loginAttacker.response.body.$.token}}
+
+###
+
+### 4.2 realtime ด้วย token ของ user ธรรมดา
+###     คำเตือน: handshake ตอบ 200 ให้ทุก token ที่ยัง valid รวม user ธรรมดา
+###     (PocketBase ไม่ปฏิเสธที่ handshake) ดังนั้น "ต่อได้" ไม่ได้แปลว่ารั่ว
+###     ต้อง subscribe topic attack_logs แล้วดูว่ามี event ส่งมาให้ไหม
+###     วิธีเช็คที่ได้ผล: เปิดหน้า dashboard ที่ login ด้วยบัญชี user ธรรมดา
+###     แล้วยิง 2.5 (login ผิดรหัส 5 ครั้ง) ถ้ามีแถวโผล่ = รั่ว
+GET {{host}}/api/realtime
+Authorization: Bearer {{loginAttacker.response.body.$.token}}
+Accept: text/event-stream
+
+###
