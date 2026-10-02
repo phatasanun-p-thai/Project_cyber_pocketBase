@@ -9,17 +9,39 @@ collection `attack_logs` พร้อมส่งอีเมลแจ้งเ�
 | Schema + API rules | `pb_migrations/` |
 | หน้าแดชบอร์ด (Tailwind ไม่มี build step) | `pb_public/index.html` |
 | Docker | `Dockerfile`, `docker-compose.yaml`, `docker/entrypoint.sh` |
+| สคริปต์เปิดใช้งาน | `start.ps1` |
 | ชุดทดสอบการโจมตี | `test.http` |
 
 ## เริ่มใช้งานแบบ Docker (แนะนำ)
 
+ครั้งแรกสร้างไฟล์ env (ทำแค่ครั้งเดียว) ค่าพอร์ตและ superuser จะถูกอ่านจากไฟล์นี้
+
 ```bash
 cp .env.example .env      # Windows: Copy-Item .env.example .env
 # แก้ค่าใน .env อย่างน้อย SUPERUSER_EMAIL / SUPERUSER_PASSWORD
-docker compose up -d --build
 ```
 
-เปิด <http://127.0.0.1:8090> แล้ว Sign in ด้วยบัญชี superuser
+จากนั้นทุกครั้งที่จะเปิดใช้งาน:
+
+```powershell
+.\start.ps1               # สตาร์ท + รอให้พร้อม + เปิดเบราว์เซอร์ให้เอง
+```
+
+| ตัวเลือก | ทำอะไร |
+| --- | --- |
+| (ไม่ใส่) | ใช้ image ที่ build ไว้แล้ว เร็วที่สุด เหมาะกับการแค่เปิดดูข้อมูล |
+| `-Build` | build image ใหม่ ใช้หลังแก้ `pb_public/` หรือ `pb_hooks/` |
+| `-NoOpen` | รันแล้วพิมพ์ URL อย่างเดียว ไม่เปิดเบราว์เซอร์ |
+| `-TimeoutSec` | จำนวนวินาทีที่ยอมรอ (ค่าเริ่มต้น 60) |
+
+สคริปต์อ่าน `POCKETBASE_PORT` จาก `.env` มาประกอบ URL ให้เอง จึงไม่ต้องแก้ที่ใหนเพิ่ม
+
+เทียบเทียบกับการรันเอง: `.\start.ps1 -NoOpen` คือ `docker compose up -d` + เปิด
+<http://127.0.0.1:8090> แล้ว Sign in ด้วยบัญชี superuser
+
+> ไฟล์ `start.ps1` ต้องมี **UTF-8 with BOM** — PowerShell 5.1 (ค่าเริ่มต้นบน Windows)
+> อ่านไฟล์ที่ไม่มี BOM เป็น ANSI แล้วข้อความไทยจะกลายเป็นอักขระยึกเยิ้ ถ้าแก้ไฟล์นี้
+> ให้บันทึกกลับเป็น UTF-8 with BOM
 
 - port ถูก publish ไว้ที่ `127.0.0.1` **เท่านั้น** (`POCKETBASE_PORT` เปลี่ยนได้)
   ถ้าจะเปิดออกนอกเครื่อง ต้องมี reverse proxy ที่มี TLS + auth ตั้งไว้ข้างหน้าเสมอ
@@ -54,7 +76,7 @@ unzip -q pocketbase.zip && rm pocketbase.zip
 
 เปิด `test.http` ด้วย VS Code REST Client / IntelliJ HTTP Client แล้วยิงตามลำดับ
 
-1. `docker compose up -d --build` (หรือ `./pocketbase serve`)
+1. `.\start.ps1` (หรือ `./pocketbase serve` ถ้ารันแบบไม่มี Docker)
 2. เปิด <http://127.0.0.1:8090> → Sign in ด้วย superuser แล้วเปิดแดชบอร์ดค้างไว้
 3. ยิง **STEP 1** ครั้งแรก 1 ครั้งต่อ instance ที่ยังสะอาด (สมัคร victim + attacker)
 4. ยิง **STEP 2 / 3 / 4** ทีละ request แล้วดูแดชบอร์ด
@@ -160,6 +182,7 @@ pb_migrations/          1790640000 attack_logs
                         1790640002 users (เหยื่อสำหรับ test.http)
 pb_public/index.html    แดชบอร์ด realtime
 pb_data/                ฐานข้อมูลจริง + types.d.ts (gitignored)
+start.ps1               สตาร์ท + เปิดเบราว์เซอร์
 test.http               ชุดทดสอบการโจมตี
 ```
 

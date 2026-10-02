@@ -188,6 +188,69 @@
       </div>
     </section>
 
+    <!-- analytics: volume over time, severity mix, targeted accounts, vectors.
+         Everything is derived from the records already loaded in state.events -
+         no extra requests, so a flood of incidents cannot make this tab pull
+         more than CFG.maxRows. -->
+    <section class="rounded-xl border border-slate-800 bg-slate-900/60">
+      <div class="flex flex-wrap items-center gap-2 border-b border-slate-800 px-4 py-3">
+        <h3 class="mr-auto text-sm font-semibold text-slate-100">Activity</h3>
+        <div id="win-picker" class="flex rounded-lg bg-slate-950 p-0.5 ring-1 ring-inset ring-slate-800">
+          <button type="button" data-win="900000"
+                  class="win-btn rounded-md px-2.5 py-1 text-[11px] font-medium text-slate-400 transition-colors hover:text-slate-200">15m</button>
+          <button type="button" data-win="3600000"
+                  class="win-btn rounded-md px-2.5 py-1 text-[11px] font-medium text-slate-400 transition-colors hover:text-slate-200">1h</button>
+          <button type="button" data-win="21600000"
+                  class="win-btn rounded-md px-2.5 py-1 text-[11px] font-medium text-slate-400 transition-colors hover:text-slate-200">6h</button>
+          <button type="button" data-win="86400000"
+                  class="win-btn rounded-md px-2.5 py-1 text-[11px] font-medium text-slate-400 transition-colors hover:text-slate-200">24h</button>
+          <button type="button" data-win="0"
+                  class="win-btn rounded-md px-2.5 py-1 text-[11px] font-medium text-slate-400 transition-colors hover:text-slate-200">all</button>
+        </div>
+      </div>
+
+      <!-- active cross-filter chips -->
+      <div id="chips" class="hidden flex-wrap items-center gap-2 border-b border-slate-800/70 px-4 py-2"></div>
+
+      <div class="grid gap-5 p-4 lg:grid-cols-[minmax(0,3fr)_minmax(0,1fr)]">
+        <!-- timeline -->
+        <div class="min-w-0">
+          <div class="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+            <p class="text-xs text-slate-400">Incidents over time</p>
+            <p id="tl-meta" class="font-mono text-[11px] text-slate-500"></p>
+          </div>
+          <div id="timeline" class="flex h-40 items-end gap-[2px]" role="img" aria-label="Incident volume over time"></div>
+          <div id="tl-axis" class="mt-1.5 flex justify-between font-mono text-[10px] text-slate-600"></div>
+        </div>
+
+        <!-- severity mix -->
+        <div class="min-w-0">
+          <p class="mb-2 text-xs text-slate-400">Severity mix</p>
+          <div class="flex items-center gap-4">
+            <div class="relative h-28 w-28 shrink-0">
+              <svg viewBox="0 0 42 42" class="h-full w-full -rotate-90" aria-hidden="true">
+                <circle cx="21" cy="21" r="18" fill="none" stroke="rgb(30 41 59)" stroke-width="5"></circle>
+                <g id="donut-arcs"></g>
+              </svg>
+              <p id="donut-total" class="absolute inset-0 grid place-items-center text-xl font-semibold tabular-nums text-slate-100">0</p>
+            </div>
+            <ul id="sev-legend" class="min-w-0 flex-1 space-y-1"></ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid gap-5 border-t border-slate-800/70 p-4 lg:grid-cols-2">
+        <div class="min-w-0">
+          <p class="mb-2 text-xs text-slate-400">Accounts targeted</p>
+          <div id="targets" class="space-y-1"></div>
+        </div>
+        <div class="min-w-0">
+          <p class="mb-2 text-xs text-slate-400">Attack vectors</p>
+          <div id="vectors" class="space-y-1"></div>
+        </div>
+      </div>
+    </section>
+
     <!-- feed + table -->
     <section class="grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
 
@@ -254,7 +317,7 @@
 </main>
 
 <script type="module">
-import PocketBase from "https://cdn.jsdelivr.net/npm/pocketbase@0.28.1/dist/pocketbase.es.mjs";
+import PocketBase, { BaseAuthStore } from "https://cdn.jsdelivr.net/npm/pocketbase@0.28.1/dist/pocketbase.es.mjs";
 
 const CFG = {
   collection: "attack_logs",
@@ -285,8 +348,95 @@ const state = {
   events: [],          // newest first
   total: 0,            // server side count, may exceed events.length
   unsubscribe: null,
-  filters: { severity: "", threatOnly: false, q: "" },
+  // `windowMs` only affects the charts and the table; the severity / target /
+  // type cross-filters are set by clicking a chart element or a legend row.
+  filters: { severity: "", threatOnly: false, q: "", windowMs: 3_600_000, target: "", type: "" },
 };
+
+// Analytics windows. `ms: 0` means "everything currently loaded".
+const WINDOWS = [
+  { label: "15m", ms: 900_000, buckets: 15 },
+  { label: "1h", ms: 3_600_000, buckets: 20 },
+  { label: "6h", ms: 21_600_000, buckets: 24 },
+  { label: "24h", ms: 86_400_000, buckets: 24 },
+  { label: "all", ms: 0, buckets: 24 },
+];
+
+// severity order used by the timeline stack (worst first) and the donut
+const SEV_ORDER = ["critical", "high", "medium", "low"];
+const SEV_HEX = {
+  critical: "#f87171",
+  high: "#fb923c",
+  medium: "#fbbf24",
+  low: "#38bdf8",
+};
+
+const SESSION_KEY = "pb_secmon_auth";
+const LEGACY_KEY = "pocketbase_auth";
+
+/**
+ * PocketBase keeps the auth token in localStorage, which means a superuser
+ * token outlives the tab and stays readable by any script on this origin.
+ *
+ * SDK 0.28.x has no `authStore.storage` and no `authStore.load()` — those were
+ * added later — so you cannot just point the stock store somewhere else, and
+ * hand-rolling the move is what broke this page before: deleting the localStorage
+ * entry made `LocalAuthStore.token` (a getter that re-reads storage on every
+ * access) return "", so every request after login went out unauthenticated and
+ * attack_logs answered 403. This subclass reads and writes sessionStorage for
+ * real, which dies with the tab.
+ */
+class SessionAuthStore extends BaseAuthStore {
+  get token() { return this._read().token || ""; }
+  get record() { return this._read().record || null; }
+  get model() { return this.record; }
+
+  save(token, model) {
+    this._write(token ? JSON.stringify({ token, record: model || null }) : "");
+    super.save(token, model);
+  }
+
+  clear() {
+    this._write("");
+    super.clear();
+  }
+
+  _read() {
+    try {
+      const raw = sessionStorage.getItem(SESSION_KEY);
+      const parsed = raw ? JSON.parse(raw) : null;
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  _write(raw) {
+    try {
+      if (raw) sessionStorage.setItem(SESSION_KEY, raw);
+      else sessionStorage.removeItem(SESSION_KEY);
+    } catch (_) {
+      // private mode / storage disabled - fall back to the in-memory token
+    }
+  }
+}
+
+/**
+ * Move a token saved by an older build out of localStorage so it does not sit
+ * there in cleartext. Only runs when the new session store is empty, otherwise
+ * a live sign-in would be overwritten by a stale token.
+ */
+function migrateLegacyToken() {
+  try {
+    if (sessionStorage.getItem(SESSION_KEY)) return;
+    const raw = localStorage.getItem(LEGACY_KEY);
+    if (!raw) return;
+    sessionStorage.setItem(SESSION_KEY, raw);
+    localStorage.removeItem(LEGACY_KEY);
+  } catch (_) {
+    // storage unavailable - nothing to migrate
+  }
+}
 
 // ---------------------------------------------------------------------------
 // boot
@@ -310,22 +460,10 @@ function boot() {
   $("in-url").value = initialUrl();
   $("endpoint-label").textContent = $("in-url").value;
 
-  state.pb = new PocketBase($("in-url").value.trim() || CFG.defaultUrl);
+  state.pb = new PocketBase($("in-url").value.trim() || CFG.defaultUrl, new SessionAuthStore());
 
-  // adopt a session token saved by a previous login on this tab
-  try {
-    const raw = sessionStorage.getItem("pb_secmon_auth");
-    if (raw) {
-      state.pb.authStore.storage = {
-        get: () => sessionStorage.getItem("pb_secmon_auth"),
-        set: (v) => (v ? sessionStorage.setItem("pb_secmon_auth", v) : sessionStorage.removeItem("pb_secmon_auth")),
-        remove: () => sessionStorage.removeItem("pb_secmon_auth"),
-      };
-      state.pb.authStore.load();
-    }
-  } catch (_) {
-    // storage unavailable
-  }
+  // a token left behind by an older build would otherwise sit in localStorage
+  migrateLegacyToken();
 
   // keep the connection badge in sync with the SSE transport
   state.pb.realtime.onDisconnect = () => setConnection(false);
@@ -379,7 +517,7 @@ async function login() {
   try {
     reconfigure();
     // a fresh client so the new credentials are used for the realtime stream
-    state.pb = new PocketBase(state.pb.baseURL);
+    state.pb = new PocketBase(state.pb.baseURL, new SessionAuthStore());
     state.pb.realtime.onDisconnect = () => setConnection(false);
 
     const res = await state.pb
@@ -388,9 +526,6 @@ async function login() {
 
     state.pb.authStore.save(res.token, res.record);
     $("in-pass").value = "";
-    // A superuser token sitting in localStorage survives the tab. Keep it out
-    // of reach of other scripts on the origin when the browser supports it.
-    hardenTokenStorage();
     await onAuthenticated();
   } catch (err) {
     showGateError(describe(err));
@@ -400,48 +535,39 @@ async function login() {
   }
 }
 
-/**
- * PocketBase keeps the auth token in localStorage by default, which means any
- * script that ends up on this origin (including a compromised CDN) can read a
- * superuser token. This moves it to a sessionStorage-backed, in-memory store
- * that is dropped when the tab closes. Best effort only - if the browser
- * blocks it the default storage is used and the dashboard still works.
- */
-function hardenTokenStorage() {
-  try {
-    const raw = localStorage.getItem("pocketbase_auth");
-    if (!raw) return;
-
-    const parsed = JSON.parse(raw);
-    sessionStorage.setItem("pb_secmon_auth", raw);
-    localStorage.removeItem("pocketbase_auth");
-
-    state.pb.authStore.storage = {
-      get: () => sessionStorage.getItem("pb_secmon_auth"),
-      set: (v) => (v ? sessionStorage.setItem("pb_secmon_auth", v) : sessionStorage.removeItem("pb_secmon_auth")),
-      remove: () => sessionStorage.removeItem("pb_secmon_auth"),
-    };
-    state.pb.authStore.load();
-  } catch (_) {
-    // private mode / storage disabled - nothing to harden, carry on
-  }
-}
-
 function logout() {
-  sessionStorage.removeItem("pb_secmon_auth");
-  localStorage.removeItem("pocketbase_auth");
+  sessionStorage.removeItem(SESSION_KEY);
+  localStorage.removeItem(LEGACY_KEY);
   state.pb.authStore.clear();
   if (state.unsubscribe) {
     state.unsubscribe();
     state.unsubscribe = null;
   }
   state.events = [];
+  state.total = 0;
   renderAll();
   setConnection(false);
   showGate();
 }
 
+/**
+ * A valid token is not necessarily a superuser one: anyone who can register on
+ * `users` gets a token that parses fine but is refused by attack_logs. Dropping
+ * it here means the gate reappears with a usable message instead of the board
+ * rendering a raw 403.
+ */
 async function onAuthenticated() {
+  if (!state.pb.authStore.isSuperuser) {
+    state.pb.authStore.clear();
+    showGateError(
+      "That account is not a superuser. Sign in with SUPERUSER_EMAIL from .env " +
+      "(attack_logs is superuser-only by design)."
+    );
+    setConnection(false);
+    showGate();
+    return;
+  }
+
   $("gate").classList.add("hidden");
   $("board").classList.remove("hidden");
   $("session-badge").classList.remove("hidden");
@@ -458,6 +584,9 @@ function startTimers() {
   startTimers.started = true;
   setInterval(() => setConnection(state.pb.realtime.isConnected), 1000);
   setInterval(updateBanner, 1000);
+  // the analytics window slides continuously, so repaint it on its own slower
+  // tick instead of rebuilding those charts every second
+  setInterval(() => { if (!$("board").classList.contains("hidden")) renderAnalytics(); }, 15_000);
   // reconcile with the REST API in case an SSE message was missed
   setInterval(() => { if (state.pb.realtime.isConnected) load(); }, CFG.refreshMs);
 }
@@ -479,6 +608,22 @@ async function load() {
     state.total = page.totalItems;
     renderAll();
   } catch (err) {
+    // 403 here means the token reached the server but was not a superuser one
+    // (or was empty). Say so and hand the user back the login gate rather than
+    // leaving the board up with an API error on it.
+    if (err.status === 403) {
+      state.pb.authStore.clear();
+      state.events = [];
+      state.total = 0;
+      renderAll();
+      showGateError(
+        "403 — not authorised. The session had no superuser token; sign in again with " +
+        "SUPERUSER_EMAIL / SUPERUSER_PASSWORD from .env."
+      );
+      setConnection(false);
+      showGate();
+      return;
+    }
     showGateError("Could not read " + CFG.collection + ": " + describe(err));
     if (!state.pb.authStore.isValid) showGate();
   }
@@ -503,10 +648,9 @@ function onRealtime({ action, record }) {
   if (action === "create") {
     state.events = dedupe([record, ...state.events]).slice(0, CFG.maxRows);
     state.total += 1;
+    // render the animated row first, then repaint the analytics from state
     renderRow(record, true);
-    renderFeed();
-    renderStats();
-    updateBanner();
+    renderAll();
   } else if (action === "update") {
     state.events = dedupe(state.events.map((e) => (e.id === record.id ? record : e)));
     renderAll();
@@ -530,6 +674,9 @@ function matches(event) {
 
   if (f.severity && event.severity !== f.severity) return false;
   if (f.threatOnly && event.severity !== "high" && event.severity !== "critical") return false;
+  if (f.target && (event.target_user || "") !== f.target) return false;
+  if (f.type && event.attack_type !== f.type) return false;
+  if (f.windowMs && ts(event.created) < Date.now() - f.windowMs) return false;
 
   if (f.q) {
     const haystack = [
@@ -542,10 +689,286 @@ function matches(event) {
 }
 
 // ---------------------------------------------------------------------------
+// analytics
+//
+// The charts deliberately ignore the severity/target/type cross-filters: a
+// chart that empties itself when you click a bar is useless for exploring the
+// next one. Only the time window applies, and the table below stays in sync.
+// ---------------------------------------------------------------------------
+
+function ts(value) {
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? 0 : d.getTime();
+}
+
+/** Events inside the selected window. */
+function windowed() {
+  const win = state.filters.windowMs;
+  if (!win) return state.events;
+  const cut = Date.now() - win;
+  return state.events.filter((e) => ts(e.created) >= cut);
+}
+
+function renderAnalytics() {
+  renderTimeline();
+  renderSeverityMix();
+  renderBreakdown("targets", (e) => e.target_user || "", "target");
+  renderBreakdown("vectors", (e) => e.attack_type || "unknown", "type");
+  renderChips();
+  syncWindowButtons();
+}
+
+function currentWindow() {
+  return WINDOWS.find((w) => w.ms === state.filters.windowMs) || WINDOWS[1];
+}
+
+function renderTimeline() {
+  const host = $("timeline");
+  const axis = $("tl-axis");
+  const win = currentWindow();
+  const events = windowed();
+  const now = Date.now();
+
+  // "all" spans from the oldest loaded incident, otherwise the selected window
+  const oldest = events.length ? Math.min(...events.map((e) => ts(e.created))) : now;
+  const start = win.ms ? now - win.ms : oldest;
+  const span = Math.max(1, now - start);
+  const size = span / win.buckets;
+
+  const buckets = Array.from({ length: win.buckets }, () => ({ critical: 0, high: 0, medium: 0, low: 0, total: 0 }));
+  for (const event of events) {
+    const index = Math.floor((ts(event.created) - start) / size);
+    const bucket = buckets[Math.min(win.buckets - 1, Math.max(0, index))];
+    const key = SEV[event.severity] ? event.severity : "low";
+    bucket[key] += 1;
+    bucket.total += 1;
+  }
+
+  const peak = Math.max(1, ...buckets.map((b) => b.total));
+  host.innerHTML = "";
+
+  for (let i = 0; i < buckets.length; i++) {
+    const bucket = buckets[i];
+    const from = new Date(start + i * size);
+    const bar = document.createElement("div");
+    bar.className = "flex h-full min-w-0 flex-1 flex-col-reverse justify-start";
+
+    if (bucket.total === 0) {
+      const flat = document.createElement("div");
+      flat.className = "h-px w-full rounded-full bg-slate-800";
+      bar.appendChild(flat);
+    } else {
+      // worst severity sits at the bottom of the stack
+      for (const key of SEV_ORDER) {
+        if (!bucket[key]) continue;
+        const seg = document.createElement("div");
+        seg.className = "w-full transition-[height] duration-300 first:rounded-b-sm last:rounded-t-sm";
+        seg.style.height = (bucket[key] / peak) * 100 + "%";
+        seg.style.backgroundColor = SEV_HEX[key];
+        seg.title = `${bucket[key]} ${key} · ${from.toLocaleTimeString()}`;
+        bar.appendChild(seg);
+      }
+    }
+
+    const detail = SEV_ORDER.map((k) => `${k} ${bucket[k]}`).join(" / ");
+    bar.title = bucket.total
+      ? `${bucket.total} incident${bucket.total === 1 ? "" : "s"} around ${from.toLocaleTimeString()}\n${detail}`
+      : `no incidents around ${from.toLocaleTimeString()}`;
+    host.appendChild(bar);
+  }
+
+  const bucketMs = size >= 3_600_000
+    ? Math.round(size / 3_600_000) + "h"
+    : Math.round(size / 60_000) + "m";
+  $("tl-meta").textContent = `bucket ${bucketMs} · peak ${peak}/bucket`;
+
+  axis.innerHTML = "";
+  for (const at of [start, start + span / 2, now]) {
+    const spanEl = document.createElement("span");
+    spanEl.textContent = new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    axis.appendChild(spanEl);
+  }
+}
+
+function renderSeverityMix() {
+  const events = windowed();
+  const arcs = $("donut-arcs");
+  const legend = $("sev-legend");
+  const counts = {};
+  for (const key of SEV_ORDER) counts[key] = 0;
+  for (const event of events) {
+    counts[SEV[event.severity] ? event.severity : "low"] += 1;
+  }
+  const total = events.length;
+
+  $("donut-total").textContent = String(total);
+  arcs.innerHTML = "";
+  legend.innerHTML = "";
+
+  // r=18 in a 42 viewBox -> circumference 2*PI*r
+  const circumference = 2 * Math.PI * 18;
+  let offset = 0;
+
+  for (const key of SEV_ORDER) {
+    const count = counts[key];
+    const share = total ? count / total : 0;
+    const selected = state.filters.severity === key;
+
+    if (count > 0) {
+      const arc = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      arc.setAttribute("cx", "21");
+      arc.setAttribute("cy", "21");
+      arc.setAttribute("r", "18");
+      arc.setAttribute("fill", "none");
+      arc.setAttribute("stroke", SEV_HEX[key]);
+      arc.setAttribute("stroke-width", selected ? "6.5" : "5");
+      arc.setAttribute("stroke-dasharray", `${circumference * share} ${circumference}`);
+      arc.setAttribute("stroke-dashoffset", String(-offset));
+      arc.setAttribute("opacity", selected || !state.filters.severity ? "1" : "0.35");
+      arcs.appendChild(arc);
+      offset += circumference * share;
+    }
+
+    const row = document.createElement("li");
+    const active = selected;
+    row.className =
+      "flex cursor-pointer items-center gap-2 rounded-md px-2 py-1 transition-colors " +
+      (active ? "bg-slate-800 ring-1 ring-inset ring-slate-700" : "hover:bg-slate-800/50");
+    row.title = active ? "clear the severity filter" : `filter the log to ${key}`;
+    row.innerHTML = `
+      <span class="h-2 w-2 shrink-0 rounded-full" style="background:${SEV_HEX[key]}"></span>
+      <span class="text-[11px] uppercase tracking-wide ${active ? "text-slate-100" : "text-slate-400"}">${key}</span>
+      <span class="ml-auto font-mono text-[11px] tabular-nums text-slate-300">${count}</span>
+      <span class="w-9 text-right font-mono text-[10px] tabular-nums text-slate-500">${total ? Math.round(share * 100) : 0}%</span>`;
+    row.addEventListener("click", () => {
+      state.filters.severity = state.filters.severity === key ? "" : key;
+      $("in-sev").value = state.filters.severity;
+      state.filters.threatOnly = false;
+      $("in-threat").checked = false;
+      renderAll();
+    });
+    legend.appendChild(row);
+  }
+
+  if (total === 0) {
+    const empty = document.createElement("li");
+    empty.className = "px-2 py-1 text-[11px] text-slate-500";
+    empty.textContent = "no incidents in this window";
+    legend.appendChild(empty);
+  }
+}
+
+/** Ranked bar list - reused for targeted accounts and attack vectors. */
+function renderBreakdown(id, pick, filterKey) {
+  const host = $(id);
+  const counts = new Map();
+  for (const event of windowed()) {
+    const key = pick(event) || "—";
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  const rows = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 6);
+  const peak = rows.length ? rows[0][1] : 1;
+  host.innerHTML = "";
+
+  if (!rows.length) {
+    const empty = document.createElement("p");
+    empty.className = "py-2 text-[11px] text-slate-500";
+    empty.textContent = "no data in this window";
+    host.appendChild(empty);
+    return;
+  }
+
+  for (const [label, count] of rows) {
+    const row = document.createElement("button");
+    row.type = "button";
+    const selected = filterKey ? state.filters[filterKey] === label : false;
+    row.className =
+      "group flex w-full items-center gap-2 rounded-md px-2 py-1 text-left transition-colors " +
+      (selected ? "bg-slate-800 ring-1 ring-inset ring-slate-700" : "hover:bg-slate-800/50");
+    row.title = selected ? "clear this filter" : `filter the log to ${label}`;
+    row.innerHTML = `
+      <span class="w-[38%] shrink-0 truncate font-mono text-[11px] ${selected ? "text-slate-100" : "text-slate-300"}">${esc(label)}</span>
+      <span class="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-slate-800">
+        <span class="block h-full rounded-full bg-sky-500/70 transition-[width] duration-300"
+              style="width:${Math.max(4, (count / peak) * 100)}%"></span>
+      </span>
+      <span class="w-7 shrink-0 text-right font-mono text-[11px] tabular-nums text-slate-400">${count}</span>`;
+    if (filterKey) {
+      row.addEventListener("click", () => {
+        state.filters[filterKey] = state.filters[filterKey] === label ? "" : label;
+        renderAll();
+      });
+    }
+    host.appendChild(row);
+  }
+}
+
+function renderChips() {
+  const host = $("chips");
+  const f = state.filters;
+  const active = [];
+  if (f.severity) active.push({ label: "severity: " + f.severity, clear: () => { f.severity = ""; $("in-sev").value = ""; } });
+  if (f.threatOnly) active.push({ label: "high + critical", clear: () => { f.threatOnly = false; $("in-threat").checked = false; } });
+  if (f.target) active.push({ label: "target: " + f.target, clear: () => { f.target = ""; } });
+  if (f.type) active.push({ label: "vector: " + f.type, clear: () => { f.type = ""; } });
+  if (f.q) active.push({ label: `search: ${f.q}`, clear: () => { f.q = ""; $("in-search").value = ""; } });
+
+  host.classList.toggle("hidden", active.length === 0);
+  host.innerHTML = "";
+  if (!active.length) return;
+
+  const label = document.createElement("span");
+  label.className = "text-[11px] text-slate-500";
+  label.textContent = "filters:";
+  host.appendChild(label);
+
+  for (const chip of active) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className =
+      "inline-flex items-center gap-1.5 rounded-full bg-slate-800 px-2.5 py-0.5 text-[11px] text-slate-200 " +
+      "ring-1 ring-inset ring-slate-700 transition-colors hover:bg-slate-700";
+    button.innerHTML = `<span class="max-w-[14rem] truncate">${esc(chip.label)}</span><span aria-hidden="true">&times;</span>`;
+    button.addEventListener("click", () => {
+      chip.clear();
+      renderAll();
+    });
+    host.appendChild(button);
+  }
+
+  const clearAll = document.createElement("button");
+  clearAll.type = "button";
+  clearAll.className = "text-[11px] text-slate-400 underline-offset-2 hover:text-slate-200 hover:underline";
+  clearAll.textContent = "clear all";
+  clearAll.addEventListener("click", () => {
+    state.filters.severity = "";
+    state.filters.threatOnly = false;
+    state.filters.target = "";
+    state.filters.type = "";
+    state.filters.q = "";
+    $("in-sev").value = "";
+    $("in-threat").checked = false;
+    $("in-search").value = "";
+    renderAll();
+  });
+  host.appendChild(clearAll);
+}
+
+function syncWindowButtons() {
+  for (const button of document.querySelectorAll(".win-btn")) {
+    const active = Number(button.dataset.win) === state.filters.windowMs;
+    button.className =
+      "win-btn rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors " +
+      (active ? "bg-slate-800 text-slate-100" : "text-slate-400 hover:text-slate-200");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // rendering
 // ---------------------------------------------------------------------------
 
 function renderAll() {
+  renderAnalytics();
   renderRows();
   renderFeed();
   renderStats();
@@ -623,9 +1046,16 @@ function cell(html, cls = "") {
 
 function renderFeed() {
   const feed = $("feed");
-  const list = visible().slice(0, CFG.maxAlerts);
+  const all = visible();
+  const list = all.slice(0, CFG.maxAlerts);
+  const badge = $("alert-count");
 
-  $("alert-count").textContent = String(state.events.length);
+  // badge tracks what the window + filters actually select, not every loaded
+  // record, otherwise it disagrees with the list underneath it
+  badge.textContent = String(all.length);
+  badge.title = list.length < all.length
+    ? `showing the ${list.length} most recent of ${all.length}`
+    : `${all.length} alert${all.length === 1 ? "" : "s"}`;
   for (const child of [...feed.children]) {
     if (child.id !== "feed-empty") child.remove();
   }
@@ -694,7 +1124,8 @@ function updateBanner() {
 
   if (threat) {
     sub.textContent =
-      `${threat.attack_type} from ${threat.ip} targeting ${threat.target_user || "unknown"} — ${relTime(threat.created)}. Admin alert email dispatched.`;
+      `${threat.attack_type} from ${threat.ip} targeting ${threat.target_user || "unknown"} — ${relTime(threat.created)}. ` +
+      `High and critical events raise an alert email; delivery is logged on the server.`;
   } else {
     sub.textContent = `No high severity activity in the last ${CFG.threatWindowMs / 1000} seconds.`;
   }
@@ -781,6 +1212,13 @@ $("in-search").addEventListener("input", (e) => {
   state.filters.q = e.target.value.trim().toLowerCase();
   renderAll();
 });
+
+for (const button of document.querySelectorAll(".win-btn")) {
+  button.addEventListener("click", () => {
+    state.filters.windowMs = Number(button.dataset.win);
+    renderAll();
+  });
+}
 
 $("win-label").textContent = CFG.threatWindowMs / 1000 + "s";
 
