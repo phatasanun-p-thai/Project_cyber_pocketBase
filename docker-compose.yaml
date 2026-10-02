@@ -27,6 +27,9 @@ services:
       - SMTP_FROM=${SMTP_FROM}
       # "implicit" for port 465 / SMTPS, empty for 587 (STARTTLS)
       - SMTP_TLS=${SMTP_TLS:-}
+      # ผู้รับอีเมลแจ้งเตือน ถ้าไม่ตั้งจะใช้อีเมลของ superuser คนแรก
+      # (มักเป็น admin@example.com ที่ไม่มีใครเปิดอ่าน) - ให้ใส่กล่องจดหมายจริง
+      - ALERT_EMAIL=${ALERT_EMAIL:-}
 
     volumes:
       # pb_data เป็นโฟลเดอร์เดียวกับที่ใช้ตอนรัน local (ดู README) - เดิมมีทั้ง

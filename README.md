@@ -118,10 +118,38 @@ null  = ให้ superuser อย่างเดียว   <- ล็อก
 | `SMTP_PORT` | `465` = SMTPS / `587` = STARTTLS |
 | `SMTP_TLS` | ค่า `implicit` บังคับ TLS ตรง (ค่าปริยายคือปล่อยให้ client ต่อรอง) |
 | `SMTP_USER` / `SMTP_PASS` / `SMTP_FROM` | Gmail ต้องใช้ App Password |
+| `ALERT_EMAIL` | ผู้รับอีเมล ถ้าเว้นว่างจะส่งไปที่อีเมล superuser คนแรก |
 
-ผู้รับเริ่มต้นคืออีเมลของ superuser คนแรก (หรือกำหนดเองที่ `SEC.adminEmail`)
+### ทำไมต้องมีขั้นตอน seed
+
+PocketBase 0.40 **ไม่ได้อ่าน `SMTP_*` จาก environment เอง** และ JS hook ก็เขียนค่า mailer
+ไม่ได้ (`_settings` เป็น system collection, `$app` ไม่มี `saveSettings()`) ค่า mailerจึงถูกเก็บ
+ใน settings record ที่แก้ได้จาก Settings > Mailer หรือ REST API เท่านั้น
+
+`docker/entrypoint.sh` จึงเป็นตัวแทน: หลัง server ตอบ `/api/health` แล้ว มันจะ auth เป็น
+superuser แล้ว `PATCH /api/settings` เพื่อ seed ค่าจาก `SMTP_*` **ทุกครั้งที่ container start**
+(rotate รหัสใน `.env` แล้ว restart ก็ได้ผลใหม่โดยไม่ต้องแตะ UI) ดู log เพื่อยืนยันว่าสำเร็จ:
+
+```
+[entrypoint] mailer configured from SMTP_* env (smtp.gmail.com:587)
+[security] alert email sent to you@example.com (CRITICAL BRUTE_FORCE)
+```
+
+จุดที่ง่ายจะพลาดในการ seed เอง (เคยเจอแล้วระหว่างทดสอบ) — ถ้าเขียนเองต้องระวังสองข้อนี้:
+
+1. **token ของ superuser ต้องส่งเป็น JWT เปล่า ๆ** คือ `Authorization: <jwt>` ไม่ใช่
+   `Authorization: Token <jwt>` — ใส่ prefix แล้วได้ `401` ทั้งที่ token นั้นถูกต้อง
+   (endpoint อื่นที่ใช้กฎจะผ่าน เพราะ superuser ถูก bypass rule)
+2. **method คือ `PATCH` ไม่ใช่ `PUT`** (`PUT` ได้ `404`)
+
+ยืนยันว่า settings ถูกบันทึกแล้วด้วย `GET /api/settings` (สังเกตว่า `smtp.password` จะ
+กลับมาเป็นค่าว่างเสมอ เพราะ PocketBase redact ไว้ ไม่ได้แปลว่ารหัสหาย)
+
 มี cooldown 2 นาทีต่อ incident และเพดาน 10 ฉบับ / 10 นาทีต่อผู้รับ กันใช้บัญชี SMTP
 เป็น mail bomb
+
+> รหัสผ่าน SMTP อยู่ใน `.env` ซึ่งถูก gitignore และถูกล้างออกจาก git history แล้ว
+> ถ้าเคย paste ค่าไว้ในที่สาธารณะ (เช่น issue/แชต) ให้ revoke App Password นั้นแล้วสร้างใหม่
 
 ## โครงสร้างโฟลเดอร์
 
@@ -141,6 +169,8 @@ test.http               ชุดทดสอบการโจมตี
 ## ก่อนขึ้น production
 
 - [ ] เปลี่ยน `SUPERUSER_PASSWORD` เป็นค่าสุ่มยาว ๆ และอย่า commit `.env`
+- [ ] ตั้ง `ALERT_EMAIL` เป็นกล่องจดหมายที่ใครมีเวลาอ่านจริง ไม่ใช่
+      `admin@example.com` (ไม่งั้นอีเมลถูกส่งแล้วไม่มีใครเห็น)
 - [ ] เปลี่ยน `users.createRule` เป็น `null` ถ้าไม่ต้องการ self-service
 - [ ] ตัด field สิทธิ์พิเศษออกจาก schema หรือป้องกันด้วย validation hook
 - [ ] ตั้ง reverse proxy ที่มี TLS ต่อหน้า อย่าออก port 8090 ตรง ๆ

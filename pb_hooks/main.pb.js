@@ -733,19 +733,17 @@ function sendSecurityAlert(ctx, verdict, payload, record, to) {
         return;
     }
 
-    let sender = smtpFromEnv() || "security@localhost";
-    try {
-        const configured = $app.settings().meta.senderAddress;
-        if (configured) {
-            sender = configured;
-        } else if (!smtpFromEnv()) {
-            console.log(
-                "[security] no SMTP sender configured - set SMTP_* in .env or configure Settings > Mailer"
-            );
-        }
-    } catch (err) {
-        // keep the fallback address
+    if (!mailerConfigured()) {
+        console.log(
+            "[security] mailer is not configured - no email sent. " +
+                "PocketBase 0.40 reads SMTP only from the stored app settings " +
+                "(superuser UI > Settings > Mailer, or PATCH /api/settings); " +
+                "SMTP_* env vars are NOT picked up by $app.newMailClient(). " +
+                "The docker entrypoint seeds them from the environment on boot."
+        );
     }
+
+    const sender = senderAddress();
 
     const targetUser = record ? record.get("target_user") : "unknown";
     const subject =
@@ -819,6 +817,15 @@ function sendSecurityAlert(ctx, verdict, payload, record, to) {
 
     try {
         newAlertMailClient().send(message);
+        console.log(
+            "[security] alert email sent to " +
+                to +
+                " (" +
+                verdict.severity.toUpperCase() +
+                " " +
+                verdict.type +
+                ")"
+        );
     } catch (err) {
         console.log("[security] failed to send the alert email:", err);
     }
@@ -827,6 +834,13 @@ function sendSecurityAlert(ctx, verdict, payload, record, to) {
 function resolveAdminEmail() {
     if (SEC.adminEmail) {
         return SEC.adminEmail;
+    }
+    // ALERT_EMAIL wins over the first superuser: the superuser is usually an
+    // internal address (admin@example.com) that nobody reads, so alerts would
+    // be delivered and never seen.
+    const fromEnv = envSettings().ALERT_EMAIL;
+    if (fromEnv) {
+        return fromEnv;
     }
     if (adminEmailResolved) {
         return adminEmailCache;
@@ -991,54 +1005,55 @@ function escapeHtml(value) {
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#39;");
 }
-}));
 
 // ============================================================================
 //  Mailer used for the alert emails
-//  `$app.saveSettings()` is not exposed to the JSVM, so a fresh container cannot
-//  be seeded through the PocketBase mailer settings. When SMTP_* is present in
-//  the environment (docker compose) we therefore build the client from it and
-//  only fall back to the mailer stored in Settings > Mailer otherwise.
+//  PocketBase 0.40 removed the `--smtpHost`/`--senderAddress` serve flags and
+//  the JSVM binding is `newMailClient(): mailer.Mailer` - it takes NO arguments
+//  and always builds the client from the stored app settings. Passing a custom
+//  settings object is silently ignored, which made every alert fall back to
+//  sendmail and fail with "failed to locate a sendmail executable path".
+//  `_settings` is a system collection that cannot be written from JS either,
+//  so the mailer must be configured through Settings > Mailer (superuser UI)
+//  or `PATCH /api/settings`. The docker entrypoint seeds it from SMTP_* on boot.
+//  These helpers must stay INSIDE the routerUse callback - see the STRUCTURE
+//  WARNING at the top of this file.
 // ============================================================================
+
+/** True when a real SMTP transport is configured (not sendmail). */
+function mailerConfigured() {
+    try {
+        const smtp = $app.settings().smtp;
+        return !!(smtp && smtp.enabled && smtp.host && smtp.host !== "smtp.example.com");
+    } catch (err) {
+        return false;
+    }
+}
+
+/** The From address. Must match the configured mailer or Gmail rejects it. */
+function senderAddress() {
+    try {
+        const configured = $app.settings().meta.senderAddress;
+        if (configured) {
+            return configured;
+        }
+    } catch (err) {
+        // fall through to the env fallback
+    }
+    const env = envSettings();
+    return env.SMTP_FROM || env.SMTP_USER || "security@localhost";
+}
 
 function envSettings() {
     return (typeof process !== "undefined" && process.env) || {};
 }
 
-function smtpFromEnv() {
-    const env = envSettings();
-    if (!env.SMTP_HOST || !env.SMTP_USER) {
-        return "";
-    }
-    return env.SMTP_FROM || env.SMTP_USER;
-}
-
 /**
- * `tls: true` means implicit TLS (SMTPS, usually 465). `SMTP_PORT=587` is
- * STARTTLS on a plain connection, which needs `tls: false` - the previous hard
- * coded `true` made every alert fail against the common 587 setup.
+ * PocketBase 0.40: no arguments. Everything (host, port, credentials, TLS,
+ * sender) comes from the stored settings.
  */
 function newAlertMailClient() {
-    const env = envSettings();
-    const host = env.SMTP_HOST;
-
-    if (!host) {
-        return $app.newMailClient();
-    }
-
-    const port = Number(env.SMTP_PORT || 587);
-    const implicitTls = String(env.SMTP_TLS || "").toLowerCase() === "implicit";
-
-    return $app.newMailClient({
-        enabled: true,
-        host: host,
-        port: port,
-        username: env.SMTP_USER || "",
-        password: env.SMTP_PASS || "",
-        // implicit TLS only on 465, otherwise let the client negotiate
-        // STARTTLS on 587 (PocketBase falls back to it when tls is false).
-        tls: implicitTls || port === 465,
-        sendmail: "",
-        from: smtpFromEnv() || "security@localhost",
-    });
+    return $app.newMailClient();
 }
+
+}));

@@ -26,8 +26,9 @@ RUN set -eux; \
 FROM alpine:3.21
 
 # ca-certificates for SMTP/TLS, tzdata so log timestamps match the wall clock,
-# su-exec to drop privileges only after the entrypoint fixed the data dir.
-RUN apk add --no-cache ca-certificates tzdata wget su-exec
+# su-exec to drop privileges only after the entrypoint fixed the data dir,
+# curl for the entrypoint to seed the mailer settings over the API.
+RUN apk add --no-cache ca-certificates tzdata wget curl su-exec
 
 COPY --from=downloader /tmp/pb/pocketbase /usr/local/bin/pocketbase
 
