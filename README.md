@@ -1,3 +1,5 @@
+นายธนกฤต ณ. พัทลุง 006-8
+
 # PocketBase Security Monitor (SIEM)
 
 SIEM เล็ก ๆ บน PocketBase — ดักจับการโจมตีที่ผ่าน REST API ทุก request แล้วบันทึกลง
@@ -202,4 +204,3 @@ test.http               ชุดทดสอบการโจมตี
 - [ ] สำรอง `pb_data/` และกำหนดว่าจะเก็บ incident นานแค่ไหน (ตอนนี้ไม่มีการล้างอัตโนมัติ)
 - [ ] ตรวจว่าเข้า `cdn.tailwindcss.com` จากเน็ตภายนอกได้ ถ้าไม่ได้ให้ self-host
       Tailwind แล้วเพิ่ม CSP
-นายธนกฤต ณ. พัทลุง 006-8
