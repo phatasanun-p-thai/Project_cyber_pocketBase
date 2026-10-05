@@ -1,12 +1,8 @@
 
-@host = http://127.0.0.1:8090
-@victim = victim@example.com
-@attacker = attacker@example.com
-@pw = Password123456
-
-### ------------------------------------------------------------
-### STEP 1 - SETUP : สร้างเหยื่อ (ทำครั้งเดียว)
-### ------------------------------------------------------------
+@host = 
+@victim = 
+@attacker = 
+@pw = 
 
 ### 1.1 register 
 # @name registerVictim
@@ -14,9 +10,9 @@ POST {{host}}/api/collections/users/records
 Content-Type: application/json
 
 {
-  "email": "Phatasanun-pemer20@rmutp.ac.th",
-  "password": "0969272021",
-  "passwordConfirm": "0969272021"
+  "email": " ",
+  "password": " ",
+  "passwordConfirm": " "
 }
 
 ### 1.2 login 
@@ -26,8 +22,8 @@ POST {{host}}/api/collections/users/auth-with-password
 Content-Type: application/json
 
 {
-  "identity": "Phatasanun-pemer20@rmutp.ac.th",
-  "password": "0969272021"
+  "identity": " ",
+  "password": " "
 }
 
 ### 2.1 login ผิดรหัสครั้งที่ 1 -> AUTH_FAILURE low
@@ -35,8 +31,8 @@ POST {{host}}/api/collections/users/auth-with-password
 Content-Type: application/json
 
 {
-  "identity": "attacker@example.com",
-  "password": "wrong-password-1"
+  "identity": " ",
+  "password": " "
 }
 
 
@@ -44,7 +40,7 @@ Content-Type: application/json
 ### STEP 3 - ATTACK : ลองโจมตีระบบ
 ### ------------------------------------------------------------
 
-### 3.1 แก้ไข record ของ victim โดยไม่ต้องมี token 
+### 3.1 [TEST 1] Mass assignment ไม่มี token + ยัด field สิทธิ์พิเศษ
 
 PATCH {{host}}/api/collections/users/records/{{registerVictim.response.body.$.id}}
 Content-Type: application/json
@@ -56,7 +52,7 @@ Content-Type: application/json
 
 ###
 
-### 3.2 แก้ไข record ของ victim โดยใช้ token ของ attacker
+### 3.2 Vertical privilege: attacker แก้ record ของ victim
 
 PATCH {{host}}/api/collections/users/records/{{registerVictim.response.body.$.id}}
 Authorization: Bearer {{loginAttacker.response.body.$.token}}
@@ -80,6 +76,7 @@ Authorization: Bearer {{loginAttacker.response.body.$.token}}
 
 ###
 
-### 3.5 เพื่อขอดูรายการข้อมูลผู้ใช้ (Users) จาก PocketBase high
+### 3.5 Injection probe ใน query string -> INJECTION_PROBE high
 GET {{host}}/api/collections/users/records?filter=(email)%3D%27victim@example.com%27%20or%201%3D1
 Authorization: Bearer {{loginAttacker.response.body.$.token}}
+

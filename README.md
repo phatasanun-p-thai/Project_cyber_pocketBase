@@ -11,6 +11,7 @@ collection `attack_logs` พร้อมส่งอีเมลแจ้งเ�
 | ส่วน | ที่อยู่ |
 | --- | --- |
 | Middlehook ตรวจจับ | `pb_hooks/main.pb.js` |
+| Dev helper ดึง reset token | `pb_hooks/dev_reset_token.pb.js` |
 | Schema + API rules | `pb_migrations/` |
 | หน้าแดชบอร์ด (Tailwind ไม่มี build step) | `pb_public/index.html` |
 | Docker | `Dockerfile`, `docker-compose.yaml`, `docker/entrypoint.sh` |
@@ -88,6 +89,68 @@ unzip -q pocketbase.zip && rm pocketbase.zip
 
 หัวไฟล์ `test.http` มีตารางผลลัพธ์ที่คาดหวังอยู่แล้ว **ตรงกับพฤติกรรมจริง** ณ ปัจจุบัน
 ถ้าแก้ `classify()` ใน hook ต้องแก้ตารางนั้นตามด้วย ไม่งั้นเอกสารจะโกหกตัวเอง
+
+## ทำไมถึงต้องมี dev_reset_token.pb.js
+
+PocketBase **ไม่เก็บ reset token ไว้ในฐานข้อมูลเลย** ยืนยันจาก schema จริง:
+
+```sql
+-- pb_data/data.db
+CREATE TABLE `_superusers` (created, email, emailVisibility, id,
+                            password, tokenKey, updated, verified)
+-- ไม่มี passwordResetToken และไม่มีตาราง _password_reset_tokens
+```
+
+ตั้งแต่ v0.23 token ถูกทำเป็น **stateless JWT** ผูกกับ `TokenConfig.secretKey`
+ฝั่ง server ยืนยันจากลายเซ็นอย่างเดียว ไม่ต้องมี state ให้เก็บ ผลคือ
+
+- `POST /api/collections/{c}/request-password-reset` ตอบ **204 No Content ว่างเปล่า**
+  จึงไม่มี token ให้ดู และหา token จากที่ไหนไม่ได้
+- อ่าน record ด้วย `$app` หรือด้วย superuser token ก็ไม่มี (REST API ยิ่งเป็นไปได้
+  เพราะ `PublicExport()` กรอง field พวกนี้ออกอีกชั้น)
+- ตัว token มีอยู่ที่เดียวคือในลิงก์ในอีเมล
+  `/_/#/auth/confirm-password-reset/<JWT>`
+
+และบนเครื่อง lab อีเมล `example.com` ส่งไม่ถึงอยู่แล้ว เพราะโดเมนนี้มี
+null MX record (RFC 7505) คือปฏิเสธอีเมลทุกชนิด ตรวจได้ด้วย
+`Resolve-DnsName example.com -Type MX` ได้ `NameExchange = "."`
+(ต่างจาก `example.com couldn't be found` ซึ่งเป็นอีเเรอร์ของกรณีที่โดเมน
+ไม่มี MX เลย)
+
+ข้อที่ทำให้ debug ยากที่สุด: Gmail ตอบ `250 OK` ตอนรับ `DATA` แล้วค่อย
+bounce ทีหลังแบบ async → **PocketBase ไม่ log error ใดๆ** ใน `docker logs`
+ทั้งที่ไม่มีใครได้รับอีเมล ต้องไปเช็ค MX เองถึงจะรู้ว่าไม่ใช่ปัญหา
+SMTP credentials วิธีเช็คว่าเป็นปัญหา SMTP จริงไหม คือยิง
+`STARTTLS` + `AUTH PLAIN` แล้วดูว่าได้ `2352.7.0 Accepted` หรือไม่
+
+`dev_reset_token.pb.js` จึงแอบจับ token ตรงจุดที่ยังมีชีวิตอยู่ คือ hook
+`onMailerRecordPasswordResetSend` (ยิง **ก่อน** SMTP ส่งจริง จึงทำงานได้แม้ผู้รับ
+จะ bounce) แล้วเก็บลง `$app.store()` ซึ่งเป็น in-memory store ระดับ app ข้าม request
+ได้ แต่หายเมื่อ restart
+
+เปิดใช้ผ่าน route ที่ผูก `$apis.requireSuperuserAuth()`:
+
+```
+GET  /api/dev/password-reset-token?collection=users&email=victim@example.com
+POST /api/dev/delete-auth-record?collection=users&email=newuser@example.com
+```
+
+ถ้ายังไม่เคยยิง `request-password-reset` route แรกจะ**ส่งอีเมล reset ให้เอง**
+ก่อน (`autoTrigger`) จึงคลิกครั้งเดียวได้ token เลย ไม่ต้องยิง 2 คำขอ ใส่
+`?trigger=0` ได้ถ้าอยากบังคับให้ยิงตามลำดับจริง
+
+route ที่สองมีไว้เพราะ `POST /api/collections/users/records` ตอบ
+**400 `validation_not_unique`** ทันทีที่ยิงซ้ำด้วยอีเมลเดิม (email มี unique
+index) ถ้าไม่มี route นี้ การสมัครผู้ใช้ซ้ำในเครื่องเดิมต้องไปแก้ชื่ออีเมลทุกครั้ง
+ตัว route ลบได้เฉพาะ `users` — `_superusers` ถูกกันไว้โดยตั้งใจ กันไม่ให้ลบ
+บัญชีแอดมินทิ้งผ่าน helper
+
+| ข้อควรรู้ | |
+| --- | --- |
+| token หมดอายุ | ตาม `settings.passwordResetToken.expiresIn` — ถ้า confirm แล้วได้ 400 ให้ขอใหม่ |
+| แก้ไฟล์นี้แล้ว | ต้อง `.\start.ps1 -Build` (Docker copy `pb_hooks/` เข้า image) |
+| `enabled = true` | ค่าในไฟล์ตอนนี้ (lab ต้องใช้ เพราะอีเมล `example.com` bounce) ถ้าแก้เป็น `false` route จะตอบ 404 — fresh clone ที่ไม่อยากเปิดช่องรั่วควรแก้เป็น false ก่อน commit |
+| ก่อนขึ้น production | **ลบไฟล์นี้ทิ้ง** |
 
 ## hook ตรวจอะไรบ้าง
 
@@ -182,6 +245,9 @@ superuser แล้ว `PATCH /api/settings` เพื่อ seed ค่าจ�
 
 ```
 pb_hooks/main.pb.js     middleware ตรวจจับทั้งหมด
+pb_hooks/dev_reset_token.pb.js
+                        DEV ONLY - GET /api/dev/password-reset-token
+                        ดูหัวข้อ "ทำไมถึงต้องมี dev_reset_token.pb.js"
 pb_migrations/          1790640000 attack_logs
                         1790640001 ล็อก attack_logs ให้ superuser
                         1790640002 users (เหยื่อสำหรับ test.http)
@@ -197,6 +263,8 @@ test.http               ชุดทดสอบการโจมตี
 ## ก่อนขึ้น production
 
 - [ ] เปลี่ยน `SUPERUSER_PASSWORD` เป็นค่าสุ่มยาว ๆ และอย่า commit `.env`
+- [ ] ลบ `pb_hooks/dev_reset_token.pb.js` ทิ้ง แล้ว rebuild image
+      (มันเปิด reset token ให้ superuser อ่านได้ แม้จะผูก auth ไว้แล้ว)
 - [ ] ตั้ง `ALERT_EMAIL` เป็นกล่องจดหมายที่ใครมีเวลาอ่านจริง ไม่ใช่
       `admin@example.com` (ไม่งั้นอีเมลถูกส่งแล้วไม่มีใครเห็น)
 - [ ] เปลี่ยน `users.createRule` เป็น `null` ถ้าไม่ต้องการ self-service

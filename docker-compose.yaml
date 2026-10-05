@@ -5,16 +5,9 @@ services:
       dockerfile: Dockerfile
     image: pocketbase-security-monitor
     container_name: pb-secmon
-
-    # PocketBase binds 127.0.0.1 by default; inside a container that makes the
-    # published port unreachable. 0.0.0.0 here is safe because the port is
-    # published to 127.0.0.1 on the host only (see `ports` below).
     command: serve --http 0.0.0.0:8090
 
     ports:
-      # loopback only: do NOT change this to 0.0.0.0 unless a reverse proxy
-      # with TLS + auth sits in front, otherwise the PocketBase admin UI and
-      # this dashboard are exposed to the network in clear text.
       - "127.0.0.1:${POCKETBASE_PORT}:8090"
 
     environment:
@@ -25,34 +18,13 @@ services:
       - SMTP_USER=${SMTP_USER}
       - SMTP_PASS=${SMTP_PASS}
       - SMTP_FROM=${SMTP_FROM}
-      # "implicit" for port 465 / SMTPS, empty for 587 (STARTTLS)
       - SMTP_TLS=${SMTP_TLS:-}
-      # ผู้รับอีเมลแจ้งเตือน ถ้าไม่ตั้งจะใช้อีเมลของ superuser คนแรก
-      # (มักเป็น admin@example.com ที่ไม่มีใครเปิดอ่าน) - ให้ใส่กล่องจดหมายจริง
       - ALERT_EMAIL=${ALERT_EMAIL:-}
 
     volumes:
-      # pb_data เป็นโฟลเดอร์เดียวกับที่ใช้ตอนรัน local (ดู README) - เดิมมีทั้ง
-      # ./data-pb และ ./pb_data ทำให้สองชุดข้อมูลคนละชุด
       - ./pb_data:/app/pb_data
 
-    # healthcheck อยู่ใน Dockerfile แล้วเพื่อไม่ให้นิยามซ้ำสองที่
-    # (compose จะ override ได้ถ้าจำเป็น)
-
     restart: unless-stopped
-
-    # Drop every capability, then add back only the three the entrypoint needs:
-    #   CHOWN    - chown the ./pb_data bind mount to uid 10001 (host-owned files)
-    #   SETGID   - used by su-exec
-    #   SETUID   - used by su-exec
-    # Without these the container dies at startup: with `cap_drop: ALL` a root
-    # process has NO capabilities, so `chown` fails with EPERM and `su-exec`
-    # cannot switch to uid 10001.
-    #
-    # The caps are only present between container start and the `su-exec` call.
-    # Exec'ing pocketbase as a non-root uid clears them, so the server itself
-    # runs with none. `no-new-privileges` additionally stops a compromised
-    # process from gaining more access through setuid binaries.
     security_opt:
       - no-new-privileges:true
     cap_drop:

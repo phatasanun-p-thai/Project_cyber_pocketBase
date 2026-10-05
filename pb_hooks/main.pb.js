@@ -416,21 +416,36 @@ function hasInjectionMarker(text) {
 /**
  * True when the authenticated caller is the record itself or its owner.
  *
+ * The id comparison has to go through the auth record's own `id`. `ctx.actor`
+ * is a human label (the e-mail for an auth record) produced by recordLabel(),
+ * so passing it to findRecordById() looks a record up by e-mail and always
+ * throws - which made every self-service read (`GET /records/<own id>`) report
+ * as a high severity BOLA on a "foreign" record.
+ *
  * Used only to decide whether a *successful* write deserves a row, so it stays
  * conservative: anything it cannot prove returns false and the write gets
  * logged. False positives on reads are preferable to blind spots here.
  */
 function ownsRecord(ctx) {
+    // Fast path: the caller is the record they just read or wrote.
     try {
-        const caller = $app.findRecordById(ctx.collection, ctx.actor);
-        return caller.id === ctx.recordId;
+        const selfId = ctx.auth && String(ctx.auth.id || "");
+        if (selfId && selfId === String(ctx.recordId)) {
+            return true;
+        }
     } catch (err) {
-        // not an auth record, or the caller is not readable by the hook
+        // not an auth record, or the id is not exposed
+    }
+
+    // Otherwise the caller may still own the record through an owner field.
+    const owner = ctx.actor;
+    if (!owner || owner === "anonymous") {
+        return false;
     }
 
     for (let i = 0; i < SEC.ownerFields.length; i++) {
         const field = SEC.ownerFields[i];
-        if (ctx.body && ctx.body[field] && String(ctx.body[field]) === ctx.actor) {
+        if (ctx.body && ctx.body[field] && String(ctx.body[field]) === owner) {
             return true;
         }
     }

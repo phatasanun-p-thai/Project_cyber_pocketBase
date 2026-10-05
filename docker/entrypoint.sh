@@ -13,6 +13,14 @@ PB_HOST="${PB_SEED_HOST:-127.0.0.1}"
 PB_PORT="${PB_SEED_PORT:-8090}"
 DOWN_UID="${PUID:-10001}"
 
+# Escape a value for embedding inside a JSON string literal.
+# Passwords routinely contain " \ and &, and interpolating them raw produced
+# malformed JSON -> the auth call 400ed and the mailer was silently left
+# unconfigured. Order matters: backslash first, then the quote.
+json_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
 upsert_superuser() {
     if [ -n "${SUPERUSER_EMAIL}" ] && [ -n "${SUPERUSER_PASSWORD}" ]; then
         echo "[entrypoint] ensuring superuser ${SUPERUSER_EMAIL}"
@@ -38,9 +46,12 @@ seed_mailer() {
         return 0
     fi
 
+    su_email=$(json_escape "${SUPERUSER_EMAIL}")
+    su_pass=$(json_escape "${SUPERUSER_PASSWORD}")
+
     token=$(curl -fsS -X POST "http://${PB_HOST}:${PB_PORT}/api/collections/_superusers/auth-with-password" \
         -H 'Content-Type: application/json' \
-        -d "{\"identity\":\"${SUPERUSER_EMAIL}\",\"password\":\"${SUPERUSER_PASSWORD}\"}" \
+        -d "{\"identity\":\"${su_email}\",\"password\":\"${su_pass}\"}" \
         2>/dev/null | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
 
     if [ -z "${token}" ]; then
@@ -58,10 +69,17 @@ seed_mailer() {
     fi
     from="${SMTP_FROM:-${SMTP_USER}}"
 
+    # same escaping as above - SMTP_PASS is the most likely value to contain a
+    # quote or backslash, and it is the one field whose breakage is silent.
+    esc_host=$(json_escape "${SMTP_HOST}")
+    esc_user=$(json_escape "${SMTP_USER}")
+    esc_pass=$(json_escape "${SMTP_PASS}")
+    esc_from=$(json_escape "${from}")
+
     code=$(curl -s -o /dev/null -w '%{http_code}' -X PATCH "http://${PB_HOST}:${PB_PORT}/api/settings" \
         -H "Authorization: ${token}" \
         -H 'Content-Type: application/json' \
-        -d "{\"smtp\":{\"enabled\":true,\"host\":\"${SMTP_HOST}\",\"port\":${port},\"username\":\"${SMTP_USER}\",\"password\":\"${SMTP_PASS}\",\"tls\":${tls},\"authMethod\":\"PLAIN\"},\"meta\":{\"senderAddress\":\"${from}\"}}")
+        -d "{\"smtp\":{\"enabled\":true,\"host\":\"${esc_host}\",\"port\":${port},\"username\":\"${esc_user}\",\"password\":\"${esc_pass}\",\"tls\":${tls},\"authMethod\":\"PLAIN\"},\"meta\":{\"senderAddress\":\"${esc_from}\"}}")
 
     if [ "${code}" = "200" ]; then
         echo "[entrypoint] mailer configured from SMTP_* env (${SMTP_HOST}:${port})"
