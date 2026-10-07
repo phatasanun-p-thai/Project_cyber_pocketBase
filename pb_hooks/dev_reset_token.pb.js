@@ -26,7 +26,7 @@
 //     ทุกชนิด) Gmail จึง bounce กลับมาเป็น
 //         "Your message wasn't delivered to admin@example.com because the
 //          domain example.com couldn't be found."
-//     ผลคือยิงหัวข้อ 1.3.1 / 2.3.1 ต่อไม่ได้ เพราะไม่มีทางรู้ token
+//     ผลคือยิงหัวข้อ forgot / reset password ต่อไม่ได้ เพราะไม่มีทางรู้ token
 //
 //  วิธีที่ใช้
 //  โฟกัสที่ `onMailerRecordPasswordResetSend` ซึ่ง PocketBase เรียก "ก่อนส่ง"
@@ -34,6 +34,11 @@
 //  ภายใน `e.message.html` เราแค่ regex ดึงออกมาเก็บลง `$app.store()` ซึ่งเป็น
 //  in-memory store ระดับ app (ข้าม request ได้ แต่หายเมื่อ restart) แล้วเสิรอร์
 //  route ไว้ให้เรียกดึงกลับผ่าน REST ได้ตรงๆ
+//
+//  route ที่เสิรอร์ไว้ (ทุกตัวผูก `$apis.requireSuperuserAuth()`)
+//    POST /api/dev/forgot-password        -> ส่งอีเมล reset + คืน token ในคำตอบเดียว
+//    GET  /api/dev/password-reset-token  -> อ่าน token ที่จับได้ล่าสุด (ไม่ส่งซ้ำ)
+//    POST /api/dev/delete-auth-record    -> ลบผู้ใช้ทดสอบเพื่อให้ register ซ้ำได้
 //
 //  ---------------------------------------------------------------------------
 //  ⚠ ระวังเรื่องความปลอดภัย
@@ -117,11 +122,11 @@ routerAdd(
         // ------------------------------------------------------------ config
         const SEC = {
             // ค่าเริ่มต้น false -> fresh clone จะได้ 404 จนกว่าจะแก้เป็น true
-            enabled: true,
+            enabled: false,
             // ชั้นที่สอง (ถ้าอยากบังคับ) เว้นว่าง = ไม่ตรวจ header
             headerName: "X-Dev-Reset-Token",
             headerValue: "",
-            allowedCollections: ["users", "_superusers"],
+            allowedCollections: ["users"],
             // ส่งอีเมล reset เองถ้ายังไม่มี token ที่จับได้ ทำให้ยิงครั้งเดียว
             // ได้ token เลย ไม่ต้องพึ่งว่าเคยยิง request-password-reset มาก่อน
             // ปิดไว้ถ้าอยากบังคับให้ทดสอบตามลำดับจริง (ใส่ ?trigger=0 ได้)
@@ -213,6 +218,119 @@ routerAdd(
 );
 
 // ---------------------------------------------------------------------------
+//  Route "ลืมรหัสผ่าน" แบบคลิกเดียวจบ -> ได้ token มาใช้ต่อทันที
+// ---------------------------------------------------------------------------
+//  ทำไมต้องมี นอกเหนือจาก `request-password-reset` ปกติ
+//  route ปกติตอบ **204 No Content เปล่า ๆ** โดยดีไซน์ของ PocketBase เอง เพราะ
+//  token เป็น JWT ที่ฝังอยู่ในลิงก์ในอีเมล ไม่มีทางดึงกลับมาทาง REST API ได้
+//  (ดูหัวข้อ "ทำไมต้องมีไฟล์นี้" ด้านบน) แถวอีเมล `example.com` ก็ส่งไม่ถึง
+//
+//  route นี้จึงรวม 3 ขั้นตอนไว้ใน request เดียว
+//      หา record -> ส่งอีเมล reset -> อ่าน token ที่ hook ข้างบนจับได้กลับมา
+//  ผลคือ test.http ยิงขั้นตอน "forgot password" ครั้งเดียวแล้วเอาค่า `token`
+//  ไปวางใน `confirm-password-reset` ต่อได้เลย
+//
+//  ต่างจาก GET /api/dev/password-reset-token ยังไง
+//  - route นี้ **ส่งอีเมลใหม่ทุกครั้ง** เพื่อให้ได้ token ที่ยังไม่ถูกใช้
+//    (ถ้ายิงซ้ำหลัง confirm ไปแล้ว store ยังเก็บ token เก่าไว้ การยิงซ้ำแบบนี้
+//    จึงเป็นวิธีที่ถูกต้องในการ "ขอ token ใหม่")
+//  - GET ตัวเดิมจะ **ไม่ส่งอีเมลซ้ำ** ถ้ามี token อยู่แล้ว เหมาะกับการยิง
+//    `request-password-reset` ปกติแล้วค่อยมาอ่าน token ตามลำดับจริง
+// ---------------------------------------------------------------------------
+routerAdd(
+    "POST",
+    "/api/dev/forgot-password",
+    (e) => {
+        const SEC = {
+            enabled: false,
+            allowedCollections: ["users"],
+        };
+
+        if (!SEC.enabled) {
+            return e.json(404, {
+                ok: false,
+                error: "dev forgot-password endpoint is disabled (set enabled = true in pb_hooks/dev_reset_token.pb.js)",
+            });
+        }
+
+        const info = e.requestInfo();
+        const q = info.query || {};
+        const collection = String(q.collection || "users").trim();
+        const email = String(q.email || "").trim();
+
+        if (SEC.allowedCollections.indexOf(collection) === -1) {
+            return e.json(400, {
+                ok: false,
+                error: "collection must be one of: " + SEC.allowedCollections.join(", "),
+            });
+        }
+
+        if (email === "") {
+            return e.json(400, {
+                ok: false,
+                error: "missing required query param: email",
+                hint: "POST /api/dev/forgot-password?collection=users&email=victim@example.com",
+            });
+        }
+
+        let record;
+        try {
+            record = $app.findAuthRecordByEmail(collection, email);
+        } catch (err) {
+            // route นี้ผูก superuser auth ไว้แล้ว จึงตอบ 404 ตรง ๆ ได้โดยไม่ต้อง
+            // กังวลเรื่อง user enumeration ของผู้ใช้ทั่วไป
+            // (request-password-reset ปกติตอบ 204 เสมอเพื่อไม่ให้ตรวจว่าอีเมล
+            //  มีอยู่จริงไหม)
+            return e.json(404, {
+                ok: false,
+                error: "no auth record for " + collection + " / " + email,
+            });
+        }
+
+        // ยิงอีเมล reset -> hook ข้างบนจับ token เก็บลง store
+        // ข้อสำคัญ: ต่อให้ send จะพังก็ต้องอ่าน store ต่อ เพราะ hook ทำงาน "ก่อน"
+        // SMTP ส่งจริง (ตามที่อธิบายไว้ด้านบน) -> ถ้า mailer ยังไม่ได้ตั้งค่าแล้ว
+        // throw ตรงนี้ เรายังเอา token ไป confirm-password-reset ต่อได้
+        let mailError = "";
+        try {
+            $mails.sendRecordPasswordReset($app, record);
+        } catch (err) {
+            mailError = String(err);
+        }
+
+        const key = "dev_reset_token::" + collection + "::" + email;
+        const entry = $app.store().get(key);
+
+        if (!entry) {
+            return e.json(502, {
+                ok: false,
+                error:
+                    "reset mail was sent but no token was captured - the link " +
+                    "format inside the mail body may have changed again",
+                mailError: mailError,
+            });
+        }
+
+        return e.json(200, {
+            ok: true,
+            collection: collection,
+            email: email,
+            recordId: entry.recordId,
+            token: entry.token,
+            confirmPath: "/_/#/auth/confirm-password-reset/" + entry.token,
+            capturedAt: entry.capturedAt,
+            mailSent: mailError === "",
+            mailError: mailError,
+            note:
+                "เอาค่า token นี้ไปใส่ใน POST /api/collections/" + collection +
+                "/confirm-password-reset ได้เลย - ใช้ได้ครั้งเดียว " +
+                "และหมดอายุตาม settings.passwordResetToken.expiresIn",
+        });
+    },
+    $apis.requireSuperuserAuth()
+);
+
+// ---------------------------------------------------------------------------
 //  Route ลบผู้ใช้ทดสอบ - ทำให้ยิง register ซ้ำได้
 // ---------------------------------------------------------------------------
 //  ทำไมต้องมี
@@ -229,8 +347,8 @@ routerAdd(
     "/api/dev/delete-auth-record",
     (e) => {
         const SEC = {
-            enabled: true,
-            // ตั้งใจไม่รวม _superusers - ลบบัญชีแอดมินทิ้งไม่ควรทำผ่าน helper
+            enabled: false,
+            // ตั้งใจไม่รวม _superusers - token ของ superuser ไม่อยู่ใน allowlist
             allowedCollections: ["users"],
         };
 

@@ -1,34 +1,82 @@
+### ------------------------------------------------------------
+###  ตัวแปรที่ใช้ทั้งไฟล์ - แก้แค่บรรทัดนี้บรรทัดเดียวก็พอ
+### ------------------------------------------------------------
 
 @host = http://127.0.0.1:8090
+
+@me = Phatsanun-satanner2000@rmutp.ac.th
+@pw = 111111111111111100
+@newPw = 111111111111111100
+@su = {{$dotenv SUPERUSER_EMAIL}}
+@suPw = {{$dotenv SUPERUSER_PASSWORD}}
+
 @victim = victim@example.com
 @attacker = attacker@example.com
-@pw = Password123456
 
-### ------------------------------------------------------------
-### STEP 1 - SETUP : สร้างเหยื่อ (ทำครั้งเดียว)
-### ------------------------------------------------------------
-
-### 1.1 register 
-# @name registerVictim
-POST {{host}}/api/collections/users/records
+### 0.1 LOGIN SUPERUSER - ยิงข้อนี้ก่อนเสมอ ทุก session
+# @name loginSuperuser
+POST {{host}}/api/collections/_superusers/auth-with-password
 Content-Type: application/json
 
 {
-  "email": "Phatasanun-pemer20@rmutp.ac.th",
-  "password": "0969272021",
-  "passwordConfirm": "0969272021"
+  "identity": "{{su}}",
+  "password": "{{suPw}}"
 }
 
-### 1.2 login 
+#### 1. SETUP - สร้างบัญชีผู้ใช้ใหม่เพื่อทดสอบ
+
+### 1.1 register
+
+# @name registerVictim
+POST {{host}}/api/collections/users/records
+Authorization: {{loginSuperuser.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "email": "{{me}}",
+  "password": "{{pw}}",
+  "passwordConfirm": "{{pw}}",
+  "verified": true
+}
+
+### 1.2 login
 
 # @name loginAttacker
 POST {{host}}/api/collections/users/auth-with-password
 Content-Type: application/json
 
 {
-  "identity": "Phatasanun-pemer20@rmutp.ac.th",
-  "password": "0969272021"
+  "identity": "{{me}}",
+  "password": "{{pw}}"
 }
+
+### 1.3 FORGOT PASSWORD 
+
+# @name forgotPassword
+POST {{host}}/api/dev/forgot-password?collection=users&email={{me}}
+Authorization: {{loginSuperuser.response.body.$.token}}
+
+### 1.4 RESET PASSWORD 
+
+# @name resetPassword
+POST {{host}}/api/collections/users/confirm-password-reset
+Content-Type: application/json
+
+{
+  "token": "{{forgotPassword.response.body.$.token}}",
+  "password": "{{newPw}}",
+  "passwordConfirm": "{{newPw}}"
+}
+
+### 1.5 PROFILE 
+
+# @name getMyProfile
+POST {{host}}/api/collections/users/auth-refresh
+Authorization: Bearer {{loginAttacker.response.body.$.token}}
+
+
+
+###
 
 ### 2.1 login ผิดรหัสครั้งที่ 1 -> AUTH_FAILURE low
 POST {{host}}/api/collections/users/auth-with-password
@@ -44,7 +92,7 @@ Content-Type: application/json
 ### STEP 3 - ATTACK : ลองโจมตีระบบ
 ### ------------------------------------------------------------
 
-### 3.1 แก้ไข record ของ victim โดยไม่ต้องมี token 
+### 3.1 แก้ไข record ของ victim โดยไม่ต้องมี token
 
 PATCH {{host}}/api/collections/users/records/{{registerVictim.response.body.$.id}}
 Content-Type: application/json
@@ -83,3 +131,4 @@ Authorization: Bearer {{loginAttacker.response.body.$.token}}
 ### 3.5 เพื่อขอดูรายการข้อมูลผู้ใช้ (Users) จาก PocketBase high
 GET {{host}}/api/collections/users/records?filter=(email)%3D%27victim@example.com%27%20or%201%3D1
 Authorization: Bearer {{loginAttacker.response.body.$.token}}
+

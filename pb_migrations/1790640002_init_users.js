@@ -38,11 +38,25 @@
 migrate(
     (app) => {
         // สร้างผ่าน Dashboard ไปแล้ว -> อย่าแตะ ให้ schema ที่ทำไว้เอง
+        let existing;
         try {
-            app.findCollectionByNameOrId("users");
-            return;
+            existing = app.findCollectionByNameOrId("users");
         } catch (err) {
-            // not found, safe to create
+            existing = null; // not found, safe to create
+        }
+
+        if (existing) {
+            // แต่ค่าที่ต้องซ่อมคือ authRule: ถ้าเป็น null แปลว่า "No one" -> ทุก
+            // auth-with-password จะตอบ 403 "The request doesn't satisfy the
+            // collection requirements to authenticate." เพราะ CanAccessRecord()
+            // คืน false ทันทีเมื่อ accessRule == nil (core/record_query.go)
+            // ค่า "" ต่างหากที่หมายถึง "Everyone" ให้ login ได้
+            // (ปกติ Dashboard สร้าง auth collection แล้วค่าเริ่มต้นเป็น null)
+            if (existing.authRule === null || existing.authRule === undefined) {
+                existing.authRule = "";
+                app.save(existing);
+            }
+            return;
         }
 
         const collection = new Collection({
@@ -67,6 +81,12 @@ migrate(
             updateRule: "@request.auth.id = @request.data.id",
 
             deleteRule: "id = @request.auth.id",
+
+            // Auth Rule = เงื่อนไขที่ต้องผ่านตอน login (คนละอันกับ 5 rule ข้างบน)
+            // null = "No one" -> login ไม่ได้สักคน (ได้ 403 ทุกครั้ง)
+            // ""    = "Everyone" -> login ได้ตามปกติ ซึ่ง test.http ข้อ 1.2 ต้องการแบบนี้
+            // ถ้าจะ require verified ให้เปลี่ยนเป็น "verified = true"
+            authRule: "",
 
             // ----------------------------------------------------------- fields
             // ฟิลด์ของ auth collection ต้องประกาศเองทุกตัว เพราะการสร้างผ่าน

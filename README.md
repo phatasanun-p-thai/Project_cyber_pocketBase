@@ -49,6 +49,23 @@ cp .env.example .env      # Windows: Copy-Item .env.example .env
 > อ่านไฟล์ที่ไม่มี BOM เป็น ANSI แล้วข้อความไทยจะกลายเป็นอักขระยึกเยิ้ ถ้าแก้ไฟล์นี้
 > ให้บันทึกกลับเป็น UTF-8 with BOM
 
+> ตรงข้ามกันคือ `docker/entrypoint.sh` ต้องเป็น **LF ไม่มี BOM** — Docker copy
+> ไฟล์จาก working tree เข้า image ตรง ๆ (ไม่ผ่าน git) ถ้าเป็น CRLF เมื่อ
+> `core.autocrlf=true` (ค่า default ของ Windows) shebang จะกลายเป็น `#!/bin/sh\r`
+> แล้ว container crash-loop ทันที ข้อความว่า
+>
+> ```
+> exec /usr/local/bin/entrypoint.sh: no such file or directory
+> ```
+>
+> อาการคือเข้า <http://127.0.0.1:8090> ไม่ได้เลย (`docker ps` จะเห็นสถานะ
+> `Restarting (255)`) ตัว `.gitattributes` บังคับ `*.sh text eol=lf` ไว้แล้ว
+> ถ้าเพิ่งเจออาการนี้ให้แปลงบรรทัดจบไฟล์กลับเป็น LF แล้ว `.\start.ps1 -Build`
+
+- ชื่อ container คือ **`pb-secmon`** ไม่ใช่ชื่อโฟลเดอร์ — `docker-compose.yaml` ตั้ง
+  `container_name: pb-secmon` ไว้ ดังนั้น `docker ps` จะไม่เจอชื่อ
+  `project_cyber_pocketbase` (นั่นคือชื่อ *compose project* ซึ่ง compose derive
+  จากชื่อโฟลเดอร์ เจอได้ด้วย `docker compose ps`)
 - port ถูก publish ไว้ที่ `127.0.0.1` **เท่านั้น** (`POCKETBASE_PORT` เปลี่ยนได้)
   ถ้าจะเปิดออกนอกเครื่อง ต้องมี reverse proxy ที่มี TLS + auth ตั้งไว้ข้างหน้าเสมอ
   admin UI ของ PocketBase และแดชบอร์ดนี้ไม่มี authentication นอกเหนือจากตัว login
@@ -84,11 +101,58 @@ unzip -q pocketbase.zip && rm pocketbase.zip
 
 1. `.\start.ps1` (หรือ `./pocketbase serve` ถ้ารันแบบไม่มี Docker)
 2. เปิด <http://127.0.0.1:8090> → Sign in ด้วย superuser แล้วเปิดแดชบอร์ดค้างไว้
-3. ยิง **STEP 1** ครั้งแรก 1 ครั้งต่อ instance ที่ยังสะอาด (สมัคร victim + attacker)
-4. ยิง **STEP 2 / 3 / 4** ทีละ request แล้วดูแดชบอร์ด
+3. แก้อีเมล/รหัสของบัญชีที่ใช้ทดสอบที่หัว `test.http` (ส่วน superuser ดึงจาก
+   `.env` ให้อัตโนมัติ)
+4. ยิงตามลำดับ **STEP 0 → 1.5 → 2.1 → 3.x** โดย STEP 0 (login superuser + ลบ
+   บัญชีเก่า) ต้องยิงทุกครั้ง ไม่งั้น `1.1` จะได้ 400 `validation_not_unique`
 
-หัวไฟล์ `test.http` มีตารางผลลัพธ์ที่คาดหวังอยู่แล้ว **ตรงกับพฤติกรรมจริง** ณ ปัจจุบัน
-ถ้าแก้ `classify()` ใน hook ต้องแก้ตารางนั้นตามด้วย ไม่งั้นเอกสารจะโกหกตัวเอง
+### ตัวแปรใน `test.http` อ่านจากไฟล์ `.env` ได้อย่างไร
+
+VS Code REST Client อ่านไฟล์ `.env` ที่อยู่ **โฟลเดอร์เดียวกับไฟล์ `.http`** ให้เอง
+ผ่านตัวแปรระบบ `{{$dotenv ชื่อ}}` (มี `%` นำหน้าได้ จะ URL-encode ให้ด้วย เช่น
+`{{%$dotenv EMAIL}}`) ตัวไฟล์นี้จึงดึงค่าจาก `.env` ตรง ๆ ไม่ต้องแก้ซ้ำสองที่
+
+| ตัวแปรใน `test.http` | อ่านจาก | ใครใช้ |
+| --- | --- | --- |
+| `@host` | พิมพ์ตาย ๆ (`127.0.0.1:8090`) | ทุก request |
+| `@su` / `@suPw` | `SUPERUSER_EMAIL` / `SUPERUSER_PASSWORD` | ข้อ 0.1 (ต้องมีสำหรับ 1.3), 0.2, A.2 |
+| `@newPw` | พิมพ์ตาย ๆ | รหัสใหม่ที่ข้อ 1.4 ตั้งให้ |
+| `@victim` / `@attacker` / `@pw` | พิมพ์ตาย ๆ | ยังไม่ได้ผูกกับ request ในไฟล์ (ข้อ 2.1 พิมพ์ค่าตรง ๆ) |
+
+> `{{$dotenv}}` เป็นฟีเจอร์ของ VS Code REST Client เท่านั้น client อื่น
+> (เช่น IntelliJ HTTP Client) จะแสดงค่าว่าง ให้แทนค่าตรง ๆ ไป
+>
+> ค่าใน `.env` ที่ผูกกับ compose กับ entrypoint คือ `POCKETBASE_PORT`,
+> `SUPERUSER_*`, `SMTP_*`, `ALERT_EMAIL` ส่วน `VICTIM_EMAIL` / `ATTACKER_EMAIL` /
+> `USER_PASSWORD` มีไว้ให้ `test.http` อย่างเดียว ไม่มีโค้ดไหนอ่านจาก
+> process env
+
+| STEP | ทำอะไร |
+| --- | --- |
+| 0 | login superuser (0.1) + ลบบัญชีทดสอบเก่า (0.2) — ต้องมีเพื่อให้ register ซ้ำได้ |
+| 1 | register → login → **forgot password (1.3 คืน `token` กลับมาใน response เดียว)** → reset password → profile |
+| 2.1 | login ผิดรหัส 1 ครั้ง → `AUTH_FAILURE` low |
+| 3 | mass assignment (3.1, 3.2) / BOLA (3.3, 3.4) / injection probe (3.5) |
+| A | ภาคผนวก: `request-password-reset` ตัวจริง + อ่าน token แบบไม่ส่งอีเมลซ้ำ |
+
+> STEP 3 ใน `test.http` ใช้ token ของผู้ใช้ที่ login ในข้อ 1.2 ซึ่งเป็น **คนเดียวกับ
+> record ที่สร้างใน 1.1** ผลจริงจึงเป็น 3.2 ได้ 200 (แก้ record ตัวเองได้ เพราะ
+> `updateRule` อนุญาต `id = @request.auth.id` — ไม่ใช่ช่องรั่ว) 3.3 ได้ 204 (ลบตัวเองได้)
+> และ 3.4 ได้ 404 เพราะ record ถูก 3.3 ลบไปแล้ว ถ้าต้องการทดสอบ BOLA จริง ๆ
+> ต้องสมัคร/ login เป็นผู้ใช้คนที่สองด้วย `@attacker` แยกจาก record ของ 1.1
+
+`test.http` มีคอมเมนต์ผลลัพธ์ที่คาดหวังกำกับทุก request อยู่แล้ว **ตรงกับพฤติกรรมจริง**
+ณ ปัจจุบัน (รวม status code ที่ PocketBase ตอบจริงด้วย เช่น 404 แทน 403 เมื่อ record
+ถูก API rule ซ่อน) ถ้าแก้ `classify()` ใน hook ต้องแก้คอมเมนต์ในไฟล์นั้นตามด้วย
+ไม่งั้นเอกสารจะโกหกตัวเอง
+
+### 3 route ที่คนมักเขียนผิด (ทดสอบแล้ว ไม่ใช่การเดา)
+
+| ที่เขียนผิด | ของจริง | อาการที่เจอ |
+| --- | --- | --- |
+| `POST .../users/reset-password` | `.../users/confirm-password-reset` | **404** เปล่า ๆ เพราะไม่ match route ของ PocketBase เลย |
+| `GET .../users/me` | ไม่มี route นี้ | **200 + body เป็น HTML** ของ dashboard (SPA fallback) ดูเหมือนสำเร็จแต่ไม่มีข้อมูล — ดูโปรไฟล์ด้วย `POST .../users/auth-refresh` (ส่ง token ใน header) แทน |
+| `?filter=(email)='x' or 1=1` | ตัวดำเนินการคือ `&&` / `\|\|` | **400** เพราะ PocketBase ไม่รับคำว่า `or` ใน filter |
 
 ## ทำไมถึงต้องมี dev_reset_token.pb.js
 
@@ -131,19 +195,32 @@ SMTP credentials วิธีเช็คว่าเป็นปัญหา SM
 เปิดใช้ผ่าน route ที่ผูก `$apis.requireSuperuserAuth()`:
 
 ```
+POST /api/dev/forgot-password?collection=users&email=victim@example.com
 GET  /api/dev/password-reset-token?collection=users&email=victim@example.com
 POST /api/dev/delete-auth-record?collection=users&email=newuser@example.com
 ```
 
-ถ้ายังไม่เคยยิง `request-password-reset` route แรกจะ**ส่งอีเมล reset ให้เอง**
+`forgot-password` คือขั้นตอน "ลืมรหัสผ่าน" แบบ **คลิกเดียวจบ**: หา record → ส่งอีเมล
+reset → คืน `token` กลับมาใน body เดียวกัน เอาไปวางใน
+`POST /api/collections/users/confirm-password-reset` ต่อได้ทันที ตัวนี้ยิงซ้ำได้
+เสมอเพราะส่งอีเมลใหม่ทุกครั้ง (ได้ token ที่ยังไม่ถูกใช้) ต่างจาก
+`password-reset-token` ที่จะไม่ส่งอีเมลซ้ำถ้ามี token อยู่แล้ว — ตัวหลังจึงเหมาะ
+กับการยิง `request-password-reset` ปกติแล้วค่อยมาอ่าน token ตามลำดับจริง
+(ถ้ายังไม่เคยยิง `request-password-reset` route นั้นจะ**ส่งอีเมล reset ให้เอง**
 ก่อน (`autoTrigger`) จึงคลิกครั้งเดียวได้ token เลย ไม่ต้องยิง 2 คำขอ ใส่
-`?trigger=0` ได้ถ้าอยากบังคับให้ยิงตามลำดับจริง
+`?trigger=0` ได้ถ้าอยากบังคับให้ยิงตามลำดับจริง)
 
 route ที่สองมีไว้เพราะ `POST /api/collections/users/records` ตอบ
 **400 `validation_not_unique`** ทันทีที่ยิงซ้ำด้วยอีเมลเดิม (email มี unique
 index) ถ้าไม่มี route นี้ การสมัครผู้ใช้ซ้ำในเครื่องเดิมต้องไปแก้ชื่ออีเมลทุกครั้ง
 ตัว route ลบได้เฉพาะ `users` — `_superusers` ถูกกันไว้โดยตั้งใจ กันไม่ให้ลบ
 บัญชีแอดมินทิ้งผ่าน helper
+
+ทั้งสาม route ต้องส่ง **token ของ superuser** ไปด้วย (เป็น JWT เปล่า ๆ ไม่ต้องมี
+prefix `Bearer `) ถ้ายิงโดยไม่มี token หรือ token หมดอายุ จะได้ 401/404 และ hook
+จะบันทึกเป็น `UNAUTHENTICATED_WRITE` / `FORBIDDEN_ACCESS` ลง `attack_logs`
+1 แถวด้วย (path `/api/dev/*` ไม่ได้อยู่ใน `SEC.ignorePaths` จึงไม่ถูกตัด) — เป็น
+เรื่องปกติ ไม่ใช่พฤติกรรมแปลก ให้ดูภาษาก่อนสรุปว่าเป็นการโจมตี
 
 | ข้อควรรู้ | |
 | --- | --- |

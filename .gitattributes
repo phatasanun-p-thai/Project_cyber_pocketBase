@@ -1,0 +1,13 @@
+# Docker copy ไฟล์จาก working tree เข้า image ตรง ๆ (ไม่ผ่าน git) ถ้า .sh
+# ถูก checkout มาเป็น CRLF เมื่อ core.autocrlf=true (ค่า default ของ Windows)
+# shebang จะกลายเป็น "#!/bin/sh\r" แล้ว exec หาไฟล์ไม่เจอ
+#     exec /usr/local/bin/entrypoint.sh: no such file or directory
+# อาการคือ container crash-loop ทันที เข้า http://127.0.0.1:8090 ไม่ได้เลย
+# บังคับให้ checkout มาเป็น LF เสมอกันเรื่องนี้
+*.sh    text eol=lf
+
+# start.ps1 จงไม่แตะ: PowerShell 5.1 (ค่า default บน Windows) อ่านได้ทั้ง LF และ
+# CRLF สิ่งที่ต้องระวังคือ **BOM** ไม่ใช่ line ending - ถ้าไม่มี BOM ข้อความไทยจะ
+# กลายเป็นอักขระยึกเยิ้ (ดูหัวข้อ "เริ่มใช้งานแบบ Docker" ใน README)
+# ประกาศ eol=crlf ที่นี่จะทำให้ git เขียนไฟล์นั้นใหม่ทุกครั้งที่ checkout
+# ซึ่งไม่จำเป็นและเสี่ยงทำให้ BOM หาย
